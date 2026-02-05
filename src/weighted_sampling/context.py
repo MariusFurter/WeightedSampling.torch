@@ -32,33 +32,20 @@ class SMCContext:
     def __init__(self, num_particles: int, ess_threshold: float = 0.5):
         self.N = num_particles
         self.ess_threshold = ess_threshold
-
         self.trace = {}
-        # Initialize log_weights to 0 (weights = 1)
         self.log_weights = torch.zeros(self.N)
 
     def effective_sample_size(self) -> torch.Tensor:
         """
-        Computes ESS = (sum w)^2 / sum(w^2)
-        In log domain:
-            2 * log_sum_exp(log_w) - log_sum_exp(2 * log_w)
-            Then exp()
+        Computes ESS = 1 / sum(w_normalized^2)
+        Uses log_softmax for stable weight normalization.
         """
-        # More numerically stable implementation usually normalizes weights first
-        # w = exp(log_w - max(log_w))
-        # ess = (sum w)^2 / sum w^2
-        # But we can work in log domain:
+        # log_w_norm = log_w - logsumexp(log_w)
+        log_w_norm = torch.nn.functional.log_softmax(self.log_weights, dim=0)
 
-        log_w = self.log_weights
-
-        # log(sum(w))
-        log_sum_w = torch.logsumexp(log_w, dim=0)
-
-        # log(sum(w^2)) = log(sum(exp(log_w * 2)))
-        log_sum_w_sq = torch.logsumexp(log_w * 2, dim=0)
-
-        log_ess = 2 * log_sum_w - log_sum_w_sq
-        return torch.exp(log_ess)
+        # ESS = 1 / sum(exp(log_w_norm)^2)
+        #     = 1 / sum(exp(2 * log_w_norm))
+        return 1.0 / torch.exp(2 * log_w_norm).sum(dim=0)
 
     def resample_if_needed(self):
         """
@@ -78,15 +65,25 @@ class SMCContext:
         # 1. Draw Ancestors
         # We need normalized probabilities for Categorical
         # logits=self.log_weights is sufficient for Categorical
-        ancestors = Categorical(logits=self.log_weights).sample((self.N,))
+        ancestors = Categorical(logits=self.log_weights).sample(torch.Size((self.N,)))
 
         # 2. Permute History (The "SIMD" Magic)
         for name, tensor in self.trace.items():
             # tensor is shape (N, ...). We index the first dim.
             self.trace[name] = tensor[ancestors]
 
-        # 3. Reset Weights
-        self.log_weights = torch.zeros(self.N, device=self.log_weights.device)
+        # 3. Reset Weights to Average Weight
+        # We reset to the average log-weight to preserve the model evidence estimate.
+        # log( 1/N * sum(w) ) = logsumexp(log_w) - log(N)
+        log_sum_w = torch.logsumexp(self.log_weights, dim=0)
+        log_avg_w = log_sum_w - torch.log(
+            torch.tensor(
+                self.N, dtype=self.log_weights.dtype, device=self.log_weights.device
+            )
+        )
+
+        # Expand back to (N,)
+        self.log_weights = log_avg_w.expand(self.N).clone()
 
 
 # -------------------------------------------------------------------------

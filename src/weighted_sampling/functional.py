@@ -32,9 +32,9 @@ def sample(name: str, distribution: dists.Distribution) -> torch.Tensor:
         # or we might need to pass sample_shape specific to N if batch_shape is empty.
         # Minimal broadcasting logic:
         if len(distribution.batch_shape) == 0:
-            sample_shape = (ctx.N,)
+            sample_shape = torch.Size((ctx.N,))
         else:
-            sample_shape = ()
+            sample_shape = torch.Size()
 
         x, log_w_inc = distribution.sample_and_log_weight(sample_shape)
 
@@ -45,14 +45,7 @@ def sample(name: str, distribution: dists.Distribution) -> torch.Tensor:
         # Standard PyTorch Distribution (Proposal = Target)
         # Check if we need to broadcast to N particles
         if len(distribution.batch_shape) == 0:
-            x = distribution.sample((ctx.N,))
-        else:
-            x = distribution.sample()
-
-        # log_w_inc is 0 implicitly
-
-    # 2. Update State
-    ctx.trace[name] = x
+            x = distribution.sample(torch.Size((ctx.N,)))
 
     # 3. Resample Check
     ctx.resample_if_needed()

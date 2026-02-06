@@ -31,7 +31,9 @@ def sample(
         The sampled tensor of shape (N, ...).
     """
     ctx = get_active_context()
-    return ctx.sample_site(name, distribution)
+    x = ctx.sample_site(name, distribution)
+
+    return x
 
 
 def observe(value: Any, distribution: Union[WeightedDistribution, dists.Distribution]):
@@ -57,19 +59,7 @@ def deterministic(name: str, value: Any) -> torch.Tensor:
     Broadcasts the value to the number of particles if necessary.
     """
     ctx = get_active_context()
-    x = torch.as_tensor(value)
-
-    # Expand if necessary to ensure first dimension is N (num_particles)
-    if x.ndim == 0:
-        x = x.expand(ctx.N)
-    elif x.shape[0] != ctx.N:
-        # Assume global parameter that needs broadcasting to particles
-        # e.g. (3, 4) -> (N, 3, 4)
-        x = x.unsqueeze(0).expand(ctx.N, *x.shape)
-
-    # If x.shape[0] == ctx.N, we assume it's already a particle trace.
-
-    ctx.trace[name] = x
+    x = ctx.deterministic_site(name, value)
     return x
 
 
@@ -97,6 +87,7 @@ def _replay_trace(
 
 
 def move(*args: Any, **kwargs) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+    #  Issue: Move signature un-transparent.
     """
     Apply a Metropolis-Hastings move to variables.
 
@@ -186,8 +177,21 @@ def move(*args: Any, **kwargs) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
             )
 
     # 3. Replay Old Trace
-    trace_old = ctx.trace.copy()
-    log_prob_old = _replay_trace(trace_old, ctx, current_move_index)
+    # Optimization: Use cached log_joint if available to avoid redundant replay
+    # If not tracking, we perform the replay once, but enable tracking for future moves
+    if hasattr(ctx, "log_joint"):
+        log_prob_old = ctx.log_joint.clone()
+    else:
+        trace_old = ctx.trace.copy()
+        log_prob_old = _replay_trace(trace_old, ctx, current_move_index)
+
+        # Enable tracking for future moves (Auto-detect optimization)
+        # We can initialize log_joint with the value we just computed (log_prob_old)
+        # Note: We must enable tracking BEFORE modifying log_joint, but log_joint attribute
+        # is only created in SMCContext when track_joint=True.
+        # We can dynamically enable it by setting the flag and creating the buffer.
+        ctx.track_joint = True
+        ctx.log_joint = log_prob_old.clone()
 
     # 4. Replay New Trace
     trace_new = ctx.trace.copy()
@@ -221,6 +225,11 @@ def move(*args: Any, **kwargs) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         ctx.trace[name][:] = x_final
         updated_values.append(x_final)
 
+    # Update log_joint if tracked
+    # With auto-detection enabled above, this should now be available for all moves
+    if hasattr(ctx, "log_joint"):
+        ctx.log_joint[:] = torch.where(accepted, log_prob_new, ctx.log_joint)
+
     if len(updated_values) == 1:
         return updated_values[0]
     else:
@@ -237,16 +246,24 @@ def run_smc(
     *args,
     num_particles: int = 1000,
     ess_threshold: float = 0.5,
+    track_joint: bool = False,
     **kwargs,
 ) -> Dict[str, Any]:
     """
     Runs Sequential Monte Carlo inference on the given model.
 
+    Args:
+        model: The probabilistic model function.
+        num_particles: Number of particles to use.
+        ess_threshold: Threshold for Effective Sample Size to trigger resampling.
+        track_joint: Explicitly enable tracking of joint log-probability.
+                     Note: 'move' operations will automatically enable this if encountered.
+
     Returns:
         trace: A dictionary of sampled tensors {name: tensor}.
                Also includes 'log_evidence' if not present in trace.
     """
-    ctx = SMCContext(num_particles, ess_threshold)
+    ctx = SMCContext(num_particles, ess_threshold, track_joint=track_joint)
     ctx.model = model
     ctx.args = args
     ctx.kwargs = kwargs

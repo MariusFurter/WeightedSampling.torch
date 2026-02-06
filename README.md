@@ -118,11 +118,14 @@ def model_with_move():
     observe(torch.tensor(5.0), dist.Normal(x, 0.1))
 
     # 1. Simple Random Walk Proposal
-    move("x", random_walk_proposal(x, 0.5))
+    move("x", RandomWalkProposal(scale=0.1))
 
     # 2. Or Adaptive Proposal based on particle covariance
-    # move("x", adaptive_proposal(x))
+    # move("x", AdaptiveProposal())
 
+### Note on Variable Names During Moves
+
+When using `move`, the model is replayed to compute acceptance ratios. To ensure correctness, **variable names must be unique within a single model execution** once a move is initiated. This applies to both `sample` and `deterministic` sites. Overwriting a variable name (e.g. `x = sample("val", ...); x = sample("val", ...)`) is forbidden during moves and will raise a `ValueError`.
 
 ```bash
 pip install git+https://github.com/mariusfurter/WeightedSampling.torch.git

@@ -32,12 +32,22 @@ class SMCContext:
                                    Shape: (N,)
     """
 
-    def __init__(self, num_particles: int, ess_threshold: float = 0.5):
+    def __init__(
+        self,
+        num_particles: int,
+        ess_threshold: float = 0.5,
+        track_joint: bool = False,
+    ):
         self.N = num_particles
         self.ess_threshold = ess_threshold
+        self.track_joint = track_joint
         self.trace = {}
         # Initialize weights to 0
         self.log_weights = torch.zeros(self.N)
+        # Track joint log-probability P(x,y) separately to optimize MH moves
+        # Only allocated if requested
+        if self.track_joint:
+            self.log_joint = torch.zeros(self.N)
 
         # State to allow replay
         self.model: Optional[Callable] = None
@@ -60,6 +70,9 @@ class SMCContext:
         # 2. Update State
         self.trace[name] = x
         self.log_weights = self.log_weights + log_w_inc
+        # Track model density p(x) for MH
+        if self.track_joint:
+            self.log_joint = self.log_joint + w_dist.log_prob(x)
 
         # 3. Resample Check
         self.resample_if_needed()
@@ -75,13 +88,20 @@ class SMCContext:
 
         # Ensure log_w is compatible with (N,)
         if log_w.ndim == 0:
-            self.log_weights = self.log_weights + log_w
+            if self.track_joint:
+                self.log_joint = self.log_joint + log_w
         elif log_w.shape[0] == self.N:
             self.log_weights = self.log_weights + log_w
+            if self.track_joint:
+                self.log_joint = self.log_joint + log_w
         else:
             # Handle shape mismatch manually
             if log_w.shape[0] == 1:
-                self.log_weights = self.log_weights + log_w.expand(self.N)
+                expanded = log_w.expand(self.N)
+                self.log_weights = self.log_weights + expanded
+                if self.track_joint:
+                    self.log_weights = self.log_weights + expanded
+                self.log_joint = self.log_joint + expanded
             else:
                 raise RuntimeError(
                     f"Observed log_prob shape {log_w.shape} incompatible with particles N={self.N}"
@@ -89,6 +109,23 @@ class SMCContext:
 
         # Resample Check
         self.resample_if_needed()
+
+    def deterministic_site(self, name: str, value: Any) -> torch.Tensor:
+        """
+        Handles deterministic values, broadcasting them to the number of particles.
+        """
+        x = torch.as_tensor(value)
+
+        # Expand if necessary to ensure first dimension is N (num_particles)
+        if x.ndim == 0:
+            x = x.expand(self.N)
+        elif x.shape[0] != self.N:
+            # Assume global parameter that needs broadcasting to particles
+            # e.g. (3, 4) -> (N, 3, 4)
+            x = x.unsqueeze(0).expand(self.N, *x.shape)
+
+        self.trace[name] = x
+        return x
 
     @property
     def log_evidence(self) -> torch.Tensor:
@@ -129,13 +166,19 @@ class SMCContext:
         3. Reset weights to uniform (average of current weights).
         """
         # 1. Draw Ancestors
-        # Categorical expects logits (unnormalized log-probs)
-        ancestors = Categorical(logits=self.log_weights).sample(torch.Size((self.N,)))
+        # Using torch.multinomial is faster than overhead of creating Categorical distribution
+        # weights must be probabilities (non-negative, sum > 0)
+        weights = torch.softmax(self.log_weights, dim=0)
+        ancestors = torch.multinomial(weights, self.N, replacement=True)
 
         # 2. Permute History
-        for name, tensor in self.trace.items():
+        for tensor in self.trace.values():
             # In-place update to keep local variables in model synced with trace
             tensor[:] = tensor[ancestors]
+
+        # Permute log_joint
+        if self.track_joint:
+            self.log_joint[:] = self.log_joint[ancestors]
 
         # 3. Reset Weights
         # We reset to the average log-weight to preserve the total weight mass (and thus Log Z estimate).
@@ -159,12 +202,13 @@ class ConditionedContext(SMCContext):
     def __init__(
         self, trace, num_particles: int, stop_at_move_index: Optional[int] = None
     ):
-        super().__init__(num_particles, ess_threshold=-1.0)
+        super().__init__(num_particles, ess_threshold=-1.0, track_joint=False)
         # Deep copy traces to ensure no accidental mutations,
         # though we shouldn't be mutating anyway in replay.
         # Shallow copy of dict is enough if tensors are not mutated in place.
         self.trace = trace.copy()
         self.stop_at_move_index = stop_at_move_index
+        self.visited = set()
 
         # Recalculate weights from scratch
         # Represent log-probs of joint density
@@ -173,6 +217,14 @@ class ConditionedContext(SMCContext):
     def sample_site(
         self, name: str, distribution: WeightedDistribution
     ) -> torch.Tensor:
+        # Check for duplicates
+        if name in self.visited:
+            raise ValueError(
+                f"Variable '{name}' already visited during replay. "
+                "Variable names must be unique within a single execution."
+            )
+        self.visited.add(name)
+
         # 1. Retrieve fixed value
         if name not in self.trace:
             raise RuntimeError(f"Variable '{name}' not found in trace during replay.")
@@ -197,6 +249,17 @@ class ConditionedContext(SMCContext):
                 )
 
         return x
+
+    def deterministic_site(self, name: str, value: Any) -> torch.Tensor:
+        # Check for duplicates or overwriting sample
+        if name in self.visited:
+            raise ValueError(
+                f"Variable '{name}' already visited during replay. "
+                "Variable names must be unique within a single execution."
+            )
+        self.visited.add(name)
+
+        return super().deterministic_site(name, value)
 
     def resample_if_needed(self):
         pass  # Disable resampling

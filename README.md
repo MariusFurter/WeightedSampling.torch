@@ -134,5 +134,11 @@ pip install git+https://github.com/mariusfurter/WeightedSampling.torch.git
 ## Run tests
 
 ```bash
+pytest tests/
+```
+
+or
+
+```bash
 python -m unittest discover tests
 ```

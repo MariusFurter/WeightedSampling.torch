@@ -1,7 +1,6 @@
 import threading
 import torch
-from typing import Optional, Callable, Tuple, Dict, Any
-from torch.distributions import Categorical
+from typing import Optional, Callable, Tuple, Dict, Any, Union, List
 from .distributions import as_weighted, WeightedDistribution
 
 # -------------------------------------------------------------------------
@@ -37,10 +36,12 @@ class SMCContext:
         num_particles: int,
         ess_threshold: float = 0.5,
         track_joint: bool = False,
+        debug: bool = False,
     ):
         self.N = num_particles
         self.ess_threshold = ess_threshold
         self.track_joint = track_joint
+        self.debug = debug
         self.trace = {}
         # Initialize weights to 0
         self.log_weights = torch.zeros(self.N)
@@ -57,12 +58,21 @@ class SMCContext:
         # Internal counter to track 'move' calls for robust replay alignment
         self.move_counter = 0
 
+        # Optional callback for progress tracking (e.g. updating a progress bar)
+        self.step_callback: Optional[Callable[[], None]] = None
+
     def sample_site(
         self, name: str, distribution: WeightedDistribution
     ) -> torch.Tensor:
         """
         Standard SMC sampling logic.
         """
+        if self.step_callback:
+            self.step_callback()
+
+        if self.debug:
+            print(f"[DEBUG] Sample '{name}'")
+
         # 1. Adapt and Sample (Vectorized)
         w_dist = as_weighted(distribution)
         x, log_w_inc = w_dist.sample_with_weight(self.N)
@@ -83,6 +93,12 @@ class SMCContext:
         """
         Standard SMC observe logic.
         """
+        if self.step_callback:
+            self.step_callback()
+
+        if self.debug:
+            print(f"[DEBUG] Observe {value:.2f}")
+
         w_dist = as_weighted(distribution)
         log_w = w_dist.log_prob(value)
 
@@ -158,6 +174,173 @@ class SMCContext:
         if ess < self.N * self.ess_threshold:
             self._resample()
 
+    def _replay_trace(self, trace: Dict[str, Any], stop_index: int) -> torch.Tensor:
+        """Helper to replay a trace and compute log-density."""
+        replay_ctx = ConditionedContext(trace, self.N, stop_at_move_index=stop_index)
+        replay_ctx.model = self.model
+        replay_ctx.args = self.args
+        replay_ctx.kwargs = self.kwargs
+
+        if self.model is None:
+            raise ValueError("Model is not set in the context.")
+
+        try:
+            with SMCScope(replay_ctx):
+                self.model(*self.args, **self.kwargs)
+        except StopReplay:
+            pass
+
+        # Use explicitly the current context in SMCScope to restore it
+        # Note: SMCScope __exit__ deletes the active_context, so we must restore self.
+        _SMC_STACK.active_context = self
+
+        return replay_ctx.log_weights
+
+    def _should_skip_move(self, names: List[str], threshold: Optional[float]) -> bool:
+        if threshold is None:
+            return False
+
+        ratios = []
+        for name in names:
+            if name in self.trace:
+                val = self.trace[name]
+                # Calculate unique count along particle dimension
+                if val.ndim > 1:
+                    unique_count = len(torch.unique(val, dim=0))
+                else:
+                    unique_count = len(torch.unique(val))
+                ratios.append(unique_count / self.N)
+
+        if ratios:
+            min_ratio = min(ratios)
+            return min_ratio >= threshold
+        return False
+
+    def _propose_new_values(
+        self, proposal: Any, x_old_dict: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        if hasattr(proposal, "propose"):
+            # We need weights for adaptive proposals
+            weights = torch.softmax(self.log_weights, dim=0)
+            x_new_dict = proposal.propose(x_old_dict, weights)
+        else:
+            raise ValueError(
+                "Proposal must have 'propose' method. "
+                "Use RandomWalkProposal() or AdaptiveProposal() factories."
+            )
+
+        # Validate shapes
+        for name, x_new in x_new_dict.items():
+            if x_new.shape != x_old_dict[name].shape:
+                raise RuntimeError(
+                    f"Proposal sample shape {x_new.shape} mismatch with variable '{name}' shape {x_old_dict[name].shape}"
+                )
+        return x_new_dict
+
+    def _update_trace_with_move(
+        self,
+        names: List[str],
+        x_old_dict: Dict[str, torch.Tensor],
+        x_new_dict: Dict[str, torch.Tensor],
+        accepted: torch.Tensor,
+    ) -> List[torch.Tensor]:
+        updated_values = []
+        for name in names:
+            x_old = x_old_dict[name]
+            x_new = x_new_dict[name]
+
+            view_shape = [self.N] + [1] * (x_old.ndim - 1)
+            acc_mask = accepted.view(*view_shape)
+
+            x_final = torch.where(acc_mask, x_new, x_old)
+
+            # Update in-place
+            self.trace[name][:] = x_final
+            updated_values.append(x_final)
+        return updated_values
+
+    def move_site(
+        self,
+        names: List[str],
+        proposal: Any,
+        threshold: Optional[float] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+        """
+        Apply a Metropolis-Hastings move to variables.
+        """
+        if self.step_callback:
+            self.step_callback()
+
+        if self.debug:
+            print(f"[DEBUG] Move attempt on {names}")
+
+        # Increment counter to identify this specific move call
+        self.move_counter += 1
+        current_move_index = self.move_counter
+
+        if not names:
+            raise ValueError("Must provide at least one variable name to move.")
+
+        # Check Gating Condition
+        if self._should_skip_move(names, threshold):
+            if len(names) == 1:
+                return self.trace[names[0]]
+            else:
+                return tuple(self.trace[name] for name in names)
+
+        # 1. Get current state
+        x_old_dict = {}
+        for name in names:
+            if name not in self.trace:
+                raise ValueError(
+                    f"Variable '{name}' not found in trace. Cannot apply move."
+                )
+            x_old_dict[name] = self.trace[name]
+
+        # 2. Propose x_new
+        x_new_dict = self._propose_new_values(proposal, x_old_dict)
+
+        # 3. Replay Old Trace
+        # Optimization: Use cached log_joint if available to avoid redundant replay
+        # If not tracking, we perform the replay once, but enable tracking for future moves
+        if hasattr(self, "log_joint"):
+            log_prob_old = self.log_joint.clone()
+        else:
+            trace_old = self.trace.copy()
+            log_prob_old = self._replay_trace(trace_old, current_move_index)
+
+            # Enable tracking for future moves (Auto-detect optimization)
+            self.track_joint = True
+            self.log_joint = log_prob_old.clone()
+
+        # 4. Replay New Trace
+        trace_new = self.trace.copy()
+        for name, x_new in x_new_dict.items():
+            trace_new[name] = x_new
+        log_prob_new = self._replay_trace(trace_new, current_move_index)
+
+        # 5. MH Step
+        # Assume symmetric proposal for now (Metropolis)
+        log_alpha = log_prob_new - log_prob_old
+
+        # Accept/Reject
+        log_u = torch.log(torch.rand(self.N, device=log_alpha.device))
+        accepted = log_u < log_alpha
+
+        # 6. Update Trace
+        updated_values = self._update_trace_with_move(
+            names, x_old_dict, x_new_dict, accepted
+        )
+
+        # Update log_joint if tracked
+        if hasattr(self, "log_joint"):
+            self.log_joint[:] = torch.where(accepted, log_prob_new, self.log_joint)
+
+        if len(updated_values) == 1:
+            return updated_values[0]
+        else:
+            return tuple(updated_values)
+
     def _resample(self):
         """
         Performs multinomial resampling:
@@ -165,6 +348,10 @@ class SMCContext:
         2. Permute all tensors in self.trace.
         3. Reset weights to uniform (average of current weights).
         """
+        if self.debug:
+            ess = self.effective_sample_size().item()
+            print(f"[DEBUG] Resampling triggered (ESS={ess:.2f})")
+
         # 1. Draw Ancestors
         # Using torch.multinomial is faster than overhead of creating Categorical distribution
         # weights must be probabilities (non-negative, sum > 0)
@@ -260,6 +447,27 @@ class ConditionedContext(SMCContext):
         self.visited.add(name)
 
         return super().deterministic_site(name, value)
+
+    def move_site(
+        self,
+        names: List[str],
+        proposal: Any,
+        threshold: Optional[float] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+        """
+        In replay mode, 'move' acts as a stopping point or a no-op retrieval.
+        """
+        self.move_counter += 1
+        current_move_index = self.move_counter
+
+        if self.stop_at_move_index == current_move_index:
+            raise StopReplay()
+
+        # Return values for names. If multiple, return tuple.
+        if len(names) == 1:
+            return self.trace[names[0]]
+        else:
+            return tuple(self.trace[name] for name in names)
 
     def resample_if_needed(self):
         pass  # Disable resampling

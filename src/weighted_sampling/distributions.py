@@ -47,30 +47,18 @@ class DistributionAdapter:
     def sample_with_weight(
         self, num_particles: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Try to expand to batch_shape=(num_particles,)
-        # This handles:
-        #   - Scalar parameters: Normal(0,1) -> expanded to particle batch
-        #   - Particle parameters: Normal(randn(N),1) -> expanded/kept as particle batch
-
-        # Optimization: check shapes to avoid try/except block and expand overhead
+        # Optimize and handle broadcasting
         batch_shape = self.dist.batch_shape
-        if len(batch_shape) > 0 and batch_shape[0] == num_particles:
-            # Already particle-batched (e.g. Normal(prev_x, 1))
-            # Calling sample() directly is faster than expand().sample() -> new object creation
+        is_particle_batched = len(batch_shape) > 0 and batch_shape[0] == num_particles
+
+        if is_particle_batched:
             x = self.dist.sample()
-        elif len(batch_shape) == 0:
-            # Scalar distribution (e.g. Normal(0, 1))
-            # sample((N,)) is generally faster than expand((N,)).sample() which creates new tensors
-            x = self.dist.sample(torch.Size((num_particles,)))
         else:
-            # Fallback for complex broadcasting or shape mismatches
-            # Issue: When would this be needed? Maybe better to just error in this case.
+            # Try expanded sampling (broadcasting), fallback to independent sampling
             try:
-                x = self.dist.expand(torch.Size((num_particles,))).sample()
+                x = self.dist.expand((num_particles,)).sample()
             except (RuntimeError, ValueError):
-                # Fallback for incompatible shapes (e.g. Normal(randn(K), 1) where K!=N).
-                # We assume the user wants N independent samples of the distribution.
-                x = self.dist.sample(torch.Size((num_particles,)))
+                x = self.dist.sample((num_particles,))
 
         if x.shape[0] != num_particles:
             raise RuntimeError(

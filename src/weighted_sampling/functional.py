@@ -1,16 +1,15 @@
 import torch
 import inspect
 import torch.distributions as dists
-from typing import Callable, Any, Dict, Union, Tuple
+from typing import Callable, Any, Dict, Union, Tuple, Optional, List
+from tqdm import tqdm
 
 from .context import (
     SMCContext,
     SMCScope,
     get_active_context,
-    ConditionedContext,
-    StopReplay,
 )
-from .distributions import as_weighted, WeightedDistribution
+from .distributions import WeightedDistribution
 
 # -------------------------------------------------------------------------
 # Primitives
@@ -63,182 +62,103 @@ def deterministic(name: str, value: Any) -> torch.Tensor:
     return x
 
 
-def _replay_trace(
-    trace: Dict[str, Any], ctx: SMCContext, stop_index: int
-) -> torch.Tensor:
-    replay_ctx = ConditionedContext(trace, ctx.N, stop_at_move_index=stop_index)
-    replay_ctx.model = ctx.model
-    replay_ctx.args = ctx.args
-    replay_ctx.kwargs = ctx.kwargs
-
-    if ctx.model is None:
-        raise ValueError("Model is not set in the context.")
-
-    try:
-        with SMCScope(replay_ctx):
-            ctx.model(*ctx.args, **ctx.kwargs)
-    except StopReplay:
-        pass
-
-    # Manually restore the outer context because SMCScope cleans up aggressively
-    SMCScope(ctx).__enter__()
-
-    return replay_ctx.log_weights
-
-
-def move(*args: Any, **kwargs) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
-    #  Issue: Move signature un-transparent.
+def move(
+    names: Union[str, List[str]],
+    proposal: Any,
+    *,
+    threshold: Optional[float] = None,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
     """
     Apply a Metropolis-Hastings move to variables.
 
     Usage:
         move("name", proposal_dist)
-        move("name1", "name2", proposal_factory)
+        move(["name1", "name2"], proposal_factory)
         move("name", proposal, threshold=0.5)
 
     Args:
-        *args: Variable names (str) followed by a proposal distribution or factory.
-        **kwargs: Optional arguments. Supported:
-                  threshold (float): Override global unique_regeneration_threshold.
+        names: Single variable name (str) or list of names (List[str]).
+        proposal: The proposal distribution or factory (must have .propose()).
+        threshold: Optional override for global unique_regeneration_threshold.
     """
     ctx = get_active_context()
 
-    # Increment counter to identify this specific move call
-    ctx.move_counter += 1
-    current_move_index = ctx.move_counter
-
-    # Parse arguments
-    names = [arg for arg in args if isinstance(arg, str)]
-    proposal = args[-1]  # Should be the last arg
-
-    # Determine threshold
-    threshold = kwargs.get("threshold", None)
-
-    if not names:
-        raise ValueError("Must provide at least one variable name to move.")
-
-    # 0. Check context type: If we are Replaying
-    if isinstance(ctx, ConditionedContext):
-        if ctx.stop_at_move_index == current_move_index:
-            raise StopReplay()
-        # Return values for names. If multiple, return tuple.
-        if len(names) == 1:
-            return ctx.trace[names[0]]
-        else:
-            return tuple(ctx.trace[name] for name in names)
-
-    # Check Gating Condition
-    if threshold is not None:
-        ratios = []
-        for name in names:
-            if name in ctx.trace:
-                val = ctx.trace[name]
-                # Calculate unique count along particle dimension
-                if val.ndim > 1:
-                    unique_count = len(torch.unique(val, dim=0))
-                else:
-                    unique_count = len(torch.unique(val))
-                ratios.append(unique_count / ctx.N)
-
-        if ratios:
-            min_ratio = min(ratios)
-            if min_ratio >= threshold:
-                # Skip Move -> Return current values
-                if len(names) == 1:
-                    return ctx.trace[names[0]]
-                else:
-                    return tuple(ctx.trace[name] for name in names)
-
-    # 1. Get current state
-    x_old_dict = {}
-    for name in names:
-        if name not in ctx.trace:
-            raise ValueError(
-                f"Variable '{name}' not found in trace. Cannot apply move."
-            )
-        x_old_dict[name] = ctx.trace[name]
-
-    # 2. Propose x_new
-    if hasattr(proposal, "propose"):
-        # We need weights for adaptive proposals
-        weights = torch.softmax(ctx.log_weights, dim=0)
-        x_new_dict = proposal.propose(x_old_dict, weights)
+    # Normalize to list
+    if isinstance(names, str):
+        names_list = [names]
     else:
-        raise ValueError(
-            "Proposal must have 'propose' method. "
-            "Use RandomWalkProposal() or AdaptiveProposal() factories."
-        )
+        names_list = names
 
-    # Validate shapes
-    for name, x_new in x_new_dict.items():
-        if x_new.shape != x_old_dict[name].shape:
-            raise RuntimeError(
-                f"Proposal sample shape {x_new.shape} mismatch with variable '{name}' shape {x_old_dict[name].shape}"
-            )
-
-    # 3. Replay Old Trace
-    # Optimization: Use cached log_joint if available to avoid redundant replay
-    # If not tracking, we perform the replay once, but enable tracking for future moves
-    if hasattr(ctx, "log_joint"):
-        log_prob_old = ctx.log_joint.clone()
-    else:
-        trace_old = ctx.trace.copy()
-        log_prob_old = _replay_trace(trace_old, ctx, current_move_index)
-
-        # Enable tracking for future moves (Auto-detect optimization)
-        # We can initialize log_joint with the value we just computed (log_prob_old)
-        # Note: We must enable tracking BEFORE modifying log_joint, but log_joint attribute
-        # is only created in SMCContext when track_joint=True.
-        # We can dynamically enable it by setting the flag and creating the buffer.
-        ctx.track_joint = True
-        ctx.log_joint = log_prob_old.clone()
-
-    # 4. Replay New Trace
-    trace_new = ctx.trace.copy()
-    for name, x_new in x_new_dict.items():
-        trace_new[name] = x_new
-    log_prob_new = _replay_trace(trace_new, ctx, current_move_index)
-
-    # 5. MH Step
-    # Assume symmetric proposal for now (Metropolis)
-    log_alpha = log_prob_new - log_prob_old
-
-    # Accept/Reject
-    log_u = torch.log(torch.rand(ctx.N, device=log_alpha.device))
-    accepted = log_u < log_alpha
-
-    # 6. Update Trace
-    # Use x_old shape of first variable to determine broadcasting of accepted mask?
-    # No, accepted is (N,). Need to broadcast per variable.
-
-    updated_values = []
-    for name in names:
-        x_old = x_old_dict[name]
-        x_new = x_new_dict[name]
-
-        view_shape = [ctx.N] + [1] * (x_old.ndim - 1)
-        acc_mask = accepted.view(*view_shape)
-
-        x_final = torch.where(acc_mask, x_new, x_old)
-
-        # Update in-place
-        ctx.trace[name][:] = x_final
-        updated_values.append(x_final)
-
-    # Update log_joint if tracked
-    # With auto-detection enabled above, this should now be available for all moves
-    if hasattr(ctx, "log_joint"):
-        ctx.log_joint[:] = torch.where(accepted, log_prob_new, ctx.log_joint)
-
-    if len(updated_values) == 1:
-        return updated_values[0]
-    else:
-        return tuple(updated_values)
+    return ctx.move_site(names_list, proposal, threshold=threshold)
 
 
 # -------------------------------------------------------------------------
 # Inference Loop
 # -------------------------------------------------------------------------
+
+
+class SMCResult(dict):
+    """
+    Encapsulates the results of an SMC execution.
+    Behaves like a dictionary but adds convenience methods for analysis.
+    """
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(f"'SMCResult' object has no attribute '{name}'")
+
+    @property
+    def log_evidence(self) -> torch.Tensor:
+        return self["log_evidence"]
+
+    @property
+    def log_weights(self) -> torch.Tensor:
+        return self["log_weights"]
+
+    def expectation(self, test_fn: Callable[..., torch.Tensor]) -> torch.Tensor:
+        return expectation(self, test_fn)
+
+    def summary(self) -> Dict[str, Dict[str, Any]]:
+        return summary(self)
+
+
+def probe_model_structure(model: Callable, *args, **kwargs) -> int:
+    """
+    Executes the model with a limited context to count the expected number of steps.
+    Used for initializing progress bars.
+
+    Args:
+        model: The probabilistic model function.
+        args: Arguments to pass to the model.
+        kwargs: Keyword arguments to pass to the model.
+
+    Returns:
+        The number of steps (sample, observe, move) encountered.
+    """
+    # Use 1 particle for minimal overhead.
+    # ess_threshold=-1.0 disables resampling.
+    # track_joint=False eliminates joint log-prob overhead.
+    ctx = SMCContext(num_particles=1, ess_threshold=-1.0, track_joint=False)
+    ctx.model = model
+    ctx.args = args
+    ctx.kwargs = kwargs
+
+    steps = 0
+
+    def counter():
+        nonlocal steps
+        steps += 1
+
+    ctx.step_callback = counter
+
+    # We assume the structure is predominantly static independent of N.
+    # We suppress exceptions if possible? No, we want to know if probing fails.
+    with SMCScope(ctx):
+        model(*args, **kwargs)
+
+    return steps
 
 
 def run_smc(
@@ -247,29 +167,55 @@ def run_smc(
     num_particles: int = 1000,
     ess_threshold: float = 0.5,
     track_joint: bool = False,
+    progress_bar: bool = False,
+    validate: bool = False,
+    debug: bool = False,
     **kwargs,
-) -> Dict[str, Any]:
+) -> SMCResult:
     """
     Runs Sequential Monte Carlo inference on the given model.
 
     Args:
         model: The probabilistic model function.
-        num_particles: Number of particles to use.
+        num_particles: Number of particles to use (N).
         ess_threshold: Threshold for Effective Sample Size to trigger resampling.
         track_joint: Explicitly enable tracking of joint log-probability.
                      Note: 'move' operations will automatically enable this if encountered.
+        progress_bar: Whether to show a progress bar (using tqdm).
+        validate: Whether to run a quick validation pass (N=1) to check model structure
+                  and trace length before full execution. This enables percentage
+                  reporting in the progress bar.
+        debug: Whether to print verbose debug information during execution.
 
     Returns:
-        trace: A dictionary of sampled tensors {name: tensor}.
-               Also includes 'log_evidence' if not present in trace.
+        SMCResult: An object containing sampled tensors and metadata.
+                   Sampled tensors have shape (N, ...).
+                   Key properties: 'log_evidence', 'log_weights'.
     """
-    ctx = SMCContext(num_particles, ess_threshold, track_joint=track_joint)
+    ctx = SMCContext(num_particles, ess_threshold, track_joint=track_joint, debug=debug)
     ctx.model = model
     ctx.args = args
     ctx.kwargs = kwargs
 
-    with SMCScope(ctx):
-        model(*args, **kwargs)
+    total_steps = None
+    if validate:
+        total_steps = probe_model_structure(model, *args, **kwargs)
+
+    pbar = None
+    if progress_bar:
+        pbar = tqdm(total=total_steps, desc="SMC Steps")
+
+        def update_pbar():
+            pbar.update(1)
+
+        ctx.step_callback = update_pbar
+
+    try:
+        with SMCScope(ctx):
+            model(*args, **kwargs)
+    finally:
+        if pbar is not None:
+            pbar.close()
 
     results = ctx.trace
 
@@ -279,7 +225,41 @@ def run_smc(
     if "log_weights" not in results:
         results["log_weights"] = ctx.log_weights
 
-    return results
+    return SMCResult(results)
+
+
+def probabilistic_model(func: Callable) -> Callable:
+    """
+    Decorator to enable running a function as a probabilistic model via SMC.
+
+    Usage:
+        @probabilistic_model
+        def model(data):
+            ...
+
+        result = model(data, num_particles=500)
+    """
+
+    def wrapper(*args, **kwargs):
+        # Extract SMC specific arguments from kwargs
+        smc_params = [
+            "num_particles",
+            "ess_threshold",
+            "track_joint",
+            "progress_bar",
+            "validate",
+            "debug",
+        ]
+        smc_kwargs = {}
+        model_kwargs = kwargs.copy()
+
+        for k in smc_params:
+            if k in model_kwargs:
+                smc_kwargs[k] = model_kwargs.pop(k)
+
+        return run_smc(func, *args, **smc_kwargs, **model_kwargs)
+
+    return wrapper
 
 
 def expectation(
@@ -309,7 +289,6 @@ def expectation(
 
     # Inspect test_fn signature to bind arguments from results
     sig = inspect.signature(test_fn)
-    kwargs = {}
 
     # Check if test_fn accepts **kwargs
     accepts_kwargs = any(
@@ -317,47 +296,23 @@ def expectation(
     )
 
     if accepts_kwargs:
-        # Pass everything we have
-        kwargs = results
+        values = test_fn(**results)
     else:
         # Only pass arguments that are requested
-        for name in sig.parameters:
-            if name in results:
-                kwargs[name] = results[name]
+        relevant_kwargs = {k: v for k, v in results.items() if k in sig.parameters}
+        values = test_fn(**relevant_kwargs)
 
-    # Evaluate test_fn
-    # Logic: The variables in results are (N, ...).
-    # We rely on test_fn to handle vectorized inputs (standard PyTorch ops do this).
-    values = test_fn(**kwargs)
+    values = torch.as_tensor(values)
 
-    if not isinstance(values, torch.Tensor):
-        values = torch.as_tensor(values)
-
-    # Compute weighted sum
-    # values shape: (N, D1, D2, ...)
-    # weights shape: (N,)
-    # We need to broadcast weights to (N, 1, 1, ...)
-
-    # Ensure values has at least 1 dim
-    if values.ndim == 0:
-        # If test_fn returns a scalar (weird if inputs are vectors), we can't really average across particles
-        # unless it returned a single scalar for the whole batch?
-        # But inputs are particles.
-        # If inputs are (N,), output should be (N,).
-        # If output is scalar conformally (e.g. user reduced it manually?), it's effectively constant?
-        # Let's assume output is (N, ...) where N is num_particles.
+    # Validation
+    N = weights.shape[0]
+    if values.ndim == 0 or values.shape[0] != N:
         raise ValueError(
-            f"test_fn returned a 0-d tensor. It should return a tensor with first dimension N={log_weights.shape[0]}"
+            f"test_fn returned shape {values.shape}. Expected first dimension to be N={N} (num_particles)."
         )
 
-    if values.shape[0] != weights.shape[0]:
-        raise ValueError(
-            f"test_fn output shape {values.shape} does not match number of particles {weights.shape[0]}"
-        )
-
-    # Broadcast weights
-    view_shape = [weights.shape[0]] + [1] * (values.ndim - 1)
-    w_expanded = weights.view(*view_shape)
+    # Broadcast weights to (N, 1, 1, ...) matching values dimensions
+    w_expanded = weights.view(N, *([1] * (values.ndim - 1)))
 
     return (values * w_expanded).sum(dim=0)
 

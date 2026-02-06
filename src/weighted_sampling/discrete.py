@@ -58,17 +58,26 @@ class DiscreteConditional:
         # Flatten all batch dims to iterate linearly
         flat_input = stacked.reshape(-1, stacked.shape[-1])
 
-        # 4. Iterate and Retrieve
-        probs_list = []
-        for row in flat_input:
+        # 4. Iterate and Retrieve (Optimized with Unique)
+        # Identify unique parent configurations to minimize calls to prob_fn
+        unique_rows, inverse_indices = torch.unique(
+            flat_input, dim=0, return_inverse=True
+        )
+
+        unique_probs_list = []
+        for row in unique_rows:
             key = tuple(row.tolist())
-            probs_list.append(self._get_probs(key))
+            unique_probs_list.append(self._get_probs(key))
+
+        # Stack unique probabilities: (Num_Unique, K)
+        # Ensure result is on same device as inputs
+        unique_probs_stack = torch.stack(unique_probs_list).to(stacked.device)
+
+        # Map back to full batch: (Total_Elements, K)
+        flat_probs = unique_probs_stack[inverse_indices]
 
         # 5. Reshape Result
         # Stack -> (Total_Elements, K)
-        # Ensure result is on same device as inputs
-        flat_probs = torch.stack(probs_list).to(stacked.device)
-
         # Reshape -> (*batch_shape, K)
         output_shape = broadcasted[0].shape + (-1,)
         probs = flat_probs.view(output_shape)

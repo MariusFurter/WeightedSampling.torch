@@ -38,9 +38,9 @@ class SMCContext:
         self.log_weights = torch.zeros(self.N)
 
     @property
-    def log_marginal_likelihood(self) -> torch.Tensor:
+    def log_evidence(self) -> torch.Tensor:
         """
-        Estimates the log marginal likelihood (log Z) of the model evidence.
+        Estimates the log model evidence (log Z) of the model.
         calc: log( 1/N * sum(exp(log_w)) ) = logsumexp(log_w) - log(N)
         """
         return torch.logsumexp(self.log_weights, dim=0) - torch.log(
@@ -81,11 +81,12 @@ class SMCContext:
 
         # 2. Permute History
         for name, tensor in self.trace.items():
-            self.trace[name] = tensor[ancestors]
+            # In-place update to keep local variables in model synced with trace
+            tensor[:] = tensor[ancestors]
 
         # 3. Reset Weights
         # We reset to the average log-weight to preserve the total weight mass (and thus Log Z estimate).
-        log_avg_w = self.log_marginal_likelihood
+        log_avg_w = self.log_evidence
         self.log_weights = log_avg_w.expand(self.N).clone()
 
 

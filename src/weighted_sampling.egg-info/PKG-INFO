@@ -1,3 +1,13 @@
+Metadata-Version: 2.4
+Name: weighted_sampling
+Version: 0.1.0
+Summary: A lightweight, vectorized Probabilistic Programming Language (PPL) for Sequential Monte Carlo (SMC) in PyTorch.
+Author: Marius Furter
+Project-URL: Homepage, https://github.com/mariusfurter/WeightedSampling.torch
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: torch
+
 # WeightedSampling.torch
 
 A lightweight, vectorized Probabilistic Programming Language (PPL) for Sequential Monte Carlo (SMC) in PyTorch.
@@ -67,5 +77,5 @@ x = sample("x", is_dist)
 ## Installation
 
 ```bash
-pip install git+https://github.com/mariusfurter/WeightedSampling.torch.git
+export PYTHONPATH=$PYTHONPATH:$(pwd)/src
 ```

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "weighted_sampling"
+version = "0.1.0"
+description = "A lightweight, vectorized Probabilistic Programming Language (PPL) for Sequential Monte Carlo (SMC) in PyTorch."
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "torch",
+]
+authors = [
+  { name="Marius Furter" },
+]
+
+[project.urls]
+"Homepage" = "https://github.com/mariusfurter/WeightedSampling.torch"
+
+[tool.setuptools.packages.find]
+where = ["src"]

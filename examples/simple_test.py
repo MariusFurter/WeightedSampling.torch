@@ -10,7 +10,7 @@ def simple_model():
 
     # 2. Likelihood: observe data=5.0 from Normal(mu, 1.0)
     # Note: 'mu' is a vector (N,). 'observe' will compute log_prob(5.0) for each particle.
-    observe(dist.Normal(mu, 1.0), torch.tensor(5.0))
+    observe(5.0, dist.Normal(mu, 1.0))
 
     return mu
 

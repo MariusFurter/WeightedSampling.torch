@@ -11,12 +11,13 @@ _SMC_STACK = threading.local()
 
 def get_active_context():
     """Returns the currently active SMCContext, or raises an error if none exists."""
-    if not hasattr(_SMC_STACK, "active_context") or _SMC_STACK.active_context is None:
+    ctx = getattr(_SMC_STACK, "active_context", None)
+    if ctx is None:
         raise RuntimeError(
             "No active SMC context found. "
             "Are you calling sample()/observe() inside a model function passed to run_smc()?"
         )
-    return _SMC_STACK.active_context
+    return ctx
 
 
 class SMCContext:
@@ -33,12 +34,24 @@ class SMCContext:
         self.N = num_particles
         self.ess_threshold = ess_threshold
         self.trace = {}
+        # Initialize weights to 0
         self.log_weights = torch.zeros(self.N)
+
+    @property
+    def log_marginal_likelihood(self) -> torch.Tensor:
+        """
+        Estimates the log marginal likelihood (log Z) of the model evidence.
+        calc: log( 1/N * sum(exp(log_w)) ) = logsumexp(log_w) - log(N)
+        """
+        return torch.logsumexp(self.log_weights, dim=0) - torch.log(
+            torch.tensor(
+                self.N, dtype=self.log_weights.dtype, device=self.log_weights.device
+            )
+        )
 
     def effective_sample_size(self) -> torch.Tensor:
         """
         Computes ESS = 1 / sum(w_normalized^2)
-        Uses log_softmax for stable weight normalization.
         """
         # log_w_norm = log_w - logsumexp(log_w)
         log_w_norm = torch.nn.functional.log_softmax(self.log_weights, dim=0)
@@ -60,29 +73,19 @@ class SMCContext:
         Performs multinomial resampling:
         1. Draw ancestor indices from categorical dist based on current weights.
         2. Permute all tensors in self.trace.
-        3. Reset weights to uniform (log_weight = 0).
+        3. Reset weights to uniform (average of current weights).
         """
         # 1. Draw Ancestors
-        # We need normalized probabilities for Categorical
-        # logits=self.log_weights is sufficient for Categorical
+        # Categorical expects logits (unnormalized log-probs)
         ancestors = Categorical(logits=self.log_weights).sample(torch.Size((self.N,)))
 
-        # 2. Permute History (The "SIMD" Magic)
+        # 2. Permute History
         for name, tensor in self.trace.items():
-            # tensor is shape (N, ...). We index the first dim.
             self.trace[name] = tensor[ancestors]
 
-        # 3. Reset Weights to Average Weight
-        # We reset to the average log-weight to preserve the model evidence estimate.
-        # log( 1/N * sum(w) ) = logsumexp(log_w) - log(N)
-        log_sum_w = torch.logsumexp(self.log_weights, dim=0)
-        log_avg_w = log_sum_w - torch.log(
-            torch.tensor(
-                self.N, dtype=self.log_weights.dtype, device=self.log_weights.device
-            )
-        )
-
-        # Expand back to (N,)
+        # 3. Reset Weights
+        # We reset to the average log-weight to preserve the total weight mass (and thus Log Z estimate).
+        log_avg_w = self.log_marginal_likelihood
         self.log_weights = log_avg_w.expand(self.N).clone()
 
 

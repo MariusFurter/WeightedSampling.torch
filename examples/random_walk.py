@@ -16,7 +16,7 @@ def random_walk_model(data):
         x = sample(f"x_{t+1}", dist.Normal(x, 1.0))
 
         # Observe
-        observe(dist.Normal(x, 0.5), y)
+        observe(y, dist.Normal(x, 0.5))
 
 
 def run_sequential_experiment():
@@ -39,13 +39,8 @@ def run_sequential_experiment():
     print(f"True trajectory (last 3): {true_x[-3:]}")
 
     # 2. Run Inference
-    # We pass the data via closure or partial, here just using lambda or direct
-    # But run_smc takes a no-arg function (or we wrap it)
-
-    def model_wrapper():
-        random_walk_model(data)
-
-    trace = run_smc(model_wrapper, num_particles=1000)
+    # We pass the data directly to run_smc, which forwards it to the model
+    trace = run_smc(random_walk_model, data, num_particles=1000)
 
     # 3. Analyze last step
     final_x = trace["x_10"]

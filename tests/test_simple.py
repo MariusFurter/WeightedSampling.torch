@@ -1,7 +1,7 @@
 import unittest
 import torch
 import torch.distributions as dist
-from weighted_sampling import run_smc, sample, observe
+from weighted_sampling import run_smc, sample, observe, summary
 
 
 def simple_model():
@@ -24,9 +24,9 @@ class TestSimpleModel(unittest.TestCase):
         torch.manual_seed(42)
         trace = run_smc(simple_model, num_particles=10000)
 
-        mu_samples = trace["mu"]
-        post_mean = mu_samples.mean().item()
-        post_std = mu_samples.std().item()
+        stats = summary(trace)
+        post_mean = stats["mu"]["mean"].item()
+        post_std = stats["mu"]["std"].item()
 
         # Expected values
         expected_mean = 4.95

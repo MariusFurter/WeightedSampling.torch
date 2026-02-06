@@ -1,7 +1,7 @@
 import unittest
 import torch
 import torch.distributions as dist
-from weighted_sampling import run_smc, sample, observe
+from weighted_sampling import run_smc, sample, observe, summary
 
 
 def random_walk_model(data):
@@ -32,8 +32,8 @@ class TestRandomWalk(unittest.TestCase):
         trace = run_smc(random_walk_model, data, num_particles=1000)
 
         # 3. Analyze last step
-        final_x = trace["x_10"]
-        estimated_mean = final_x.mean().item()
+        stats = summary(trace)
+        estimated_mean = stats["x_10"]["mean"].item()
         true_last = true_x[-1]
 
         print(f"\nRandom Walk: Estimated={estimated_mean:.4f}, True={true_last:.4f}")

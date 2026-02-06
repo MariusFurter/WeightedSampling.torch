@@ -1,7 +1,7 @@
 import unittest
 import torch
 import torch.distributions as dist
-from weighted_sampling import run_smc, sample, ImportanceSampler
+from weighted_sampling import run_smc, sample, ImportanceSampler, summary
 
 
 def importance_model():
@@ -21,11 +21,11 @@ class TestImportanceSampling(unittest.TestCase):
         # N needs to be high for decent IS
         trace = run_smc(importance_model, num_particles=100000)
 
-        x_samples = trace["x"]
-        mean = x_samples.mean().item()
+        stats = summary(trace)
+        mean = stats["x"]["mean"].item()
 
         # Target mean is 3.0
-        print(f"\nIS Model: Mean={mean:.4f}")
+        print(f"\nIS Model: Mean={mean:.4f}", " Target=3.0")
 
         self.assertAlmostEqual(mean, 3.0, delta=0.1, msg="IS mean did not match target")
 

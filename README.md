@@ -69,3 +69,9 @@ x = sample("x", is_dist)
 ```bash
 pip install git+https://github.com/mariusfurter/WeightedSampling.torch.git
 ```
+
+## Run tests
+
+```bash
+python -m unittest discover tests
+```

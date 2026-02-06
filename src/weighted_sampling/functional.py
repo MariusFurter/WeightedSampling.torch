@@ -1,9 +1,15 @@
 import torch
 import inspect
 import torch.distributions as dists
-from typing import Callable, Any, Dict, Union
+from typing import Callable, Any, Dict, Union, Tuple
 
-from .context import SMCContext, SMCScope, get_active_context
+from .context import (
+    SMCContext,
+    SMCScope,
+    get_active_context,
+    ConditionedContext,
+    StopReplay,
+)
 from .distributions import as_weighted, WeightedDistribution
 
 # -------------------------------------------------------------------------
@@ -25,20 +31,7 @@ def sample(
         The sampled tensor of shape (N, ...).
     """
     ctx = get_active_context()
-
-    # 1. Adapt and Sample (Vectorized)
-    # The adapter handles broadcasting and computing incremental weights
-    w_dist = as_weighted(distribution)
-    x, log_w_inc = w_dist.sample_with_weight(ctx.N)
-
-    # 2. Update State
-    ctx.trace[name] = x
-    ctx.log_weights = ctx.log_weights + log_w_inc
-
-    # 3. Resample Check
-    ctx.resample_if_needed()
-
-    return x
+    return ctx.sample_site(name, distribution)
 
 
 def observe(value: Any, distribution: Union[WeightedDistribution, dists.Distribution]):
@@ -55,40 +48,7 @@ def observe(value: Any, distribution: Union[WeightedDistribution, dists.Distribu
     if not isinstance(value, torch.Tensor):
         value = torch.as_tensor(value)
 
-    # Calculate log_prob
-    # If distribution is a DistributionAdapter, it creates an expanded dist inside sample(),
-    # but currently its log_prob just delegates.
-    # We should ensure we evaluate log_prob against the particle context if possible.
-
-    # Adapt validation
-    w_dist = as_weighted(distribution)
-
-    # We try to trust the broadcast behavior of log_prob(value)
-    # If value is (N, ...) and dist is (N, ...), we get (N,).
-    # If value is scalar and dist is (N, ...), we get (N,).
-    # If value is scalar and dist is scalar, we get scalar.
-
-    log_w = w_dist.log_prob(value)
-
-    # Ensure log_w is compatible with (N,)
-    if log_w.ndim == 0:
-        # Scalar weight -> apply to all particles
-        ctx.log_weights = ctx.log_weights + log_w
-    elif log_w.shape[0] == ctx.N:
-        # Vector weight -> elementwise
-        ctx.log_weights = ctx.log_weights + log_w
-    else:
-        # Shape mismatch (e.g. log_w is (M,) but N=100)
-        # Try to expand? Only if shape[0]==1
-        if log_w.shape[0] == 1:
-            ctx.log_weights = ctx.log_weights + log_w.expand(ctx.N)
-        else:
-            raise RuntimeError(
-                f"Observed log_prob shape {log_w.shape} incompatible with particles N={ctx.N}"
-            )
-
-    # 2. Resample Check
-    ctx.resample_if_needed()
+    ctx.observe_site(value, distribution)
 
 
 def deterministic(name: str, value: Any) -> torch.Tensor:
@@ -113,6 +73,160 @@ def deterministic(name: str, value: Any) -> torch.Tensor:
     return x
 
 
+def _replay_trace(
+    trace: Dict[str, Any], ctx: SMCContext, stop_index: int
+) -> torch.Tensor:
+    replay_ctx = ConditionedContext(trace, ctx.N, stop_at_move_index=stop_index)
+    replay_ctx.model = ctx.model
+    replay_ctx.args = ctx.args
+    replay_ctx.kwargs = ctx.kwargs
+
+    if ctx.model is None:
+        raise ValueError("Model is not set in the context.")
+
+    try:
+        with SMCScope(replay_ctx):
+            ctx.model(*ctx.args, **ctx.kwargs)
+    except StopReplay:
+        pass
+
+    # Manually restore the outer context because SMCScope cleans up aggressively
+    SMCScope(ctx).__enter__()
+
+    return replay_ctx.log_weights
+
+
+def move(*args: Any, **kwargs) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+    """
+    Apply a Metropolis-Hastings move to variables.
+
+    Usage:
+        move("name", proposal_dist)
+        move("name1", "name2", proposal_factory)
+        move("name", proposal, threshold=0.5)
+
+    Args:
+        *args: Variable names (str) followed by a proposal distribution or factory.
+        **kwargs: Optional arguments. Supported:
+                  threshold (float): Override global unique_regeneration_threshold.
+    """
+    ctx = get_active_context()
+
+    # Increment counter to identify this specific move call
+    ctx.move_counter += 1
+    current_move_index = ctx.move_counter
+
+    # Parse arguments
+    names = [arg for arg in args if isinstance(arg, str)]
+    proposal = args[-1]  # Should be the last arg
+
+    # Determine threshold
+    threshold = kwargs.get("threshold", None)
+
+    if not names:
+        raise ValueError("Must provide at least one variable name to move.")
+
+    # 0. Check context type: If we are Replaying
+    if isinstance(ctx, ConditionedContext):
+        if ctx.stop_at_move_index == current_move_index:
+            raise StopReplay()
+        # Return values for names. If multiple, return tuple.
+        if len(names) == 1:
+            return ctx.trace[names[0]]
+        else:
+            return tuple(ctx.trace[name] for name in names)
+
+    # Check Gating Condition
+    if threshold is not None:
+        ratios = []
+        for name in names:
+            if name in ctx.trace:
+                val = ctx.trace[name]
+                # Calculate unique count along particle dimension
+                if val.ndim > 1:
+                    unique_count = len(torch.unique(val, dim=0))
+                else:
+                    unique_count = len(torch.unique(val))
+                ratios.append(unique_count / ctx.N)
+
+        if ratios:
+            min_ratio = min(ratios)
+            if min_ratio >= threshold:
+                # Skip Move -> Return current values
+                if len(names) == 1:
+                    return ctx.trace[names[0]]
+                else:
+                    return tuple(ctx.trace[name] for name in names)
+
+    # 1. Get current state
+    x_old_dict = {}
+    for name in names:
+        if name not in ctx.trace:
+            raise ValueError(
+                f"Variable '{name}' not found in trace. Cannot apply move."
+            )
+        x_old_dict[name] = ctx.trace[name]
+
+    # 2. Propose x_new
+    if hasattr(proposal, "propose"):
+        # We need weights for adaptive proposals
+        weights = torch.softmax(ctx.log_weights, dim=0)
+        x_new_dict = proposal.propose(x_old_dict, weights)
+    else:
+        raise ValueError(
+            "Proposal must have 'propose' method. "
+            "Use RandomWalkProposal() or AdaptiveProposal() factories."
+        )
+
+    # Validate shapes
+    for name, x_new in x_new_dict.items():
+        if x_new.shape != x_old_dict[name].shape:
+            raise RuntimeError(
+                f"Proposal sample shape {x_new.shape} mismatch with variable '{name}' shape {x_old_dict[name].shape}"
+            )
+
+    # 3. Replay Old Trace
+    trace_old = ctx.trace.copy()
+    log_prob_old = _replay_trace(trace_old, ctx, current_move_index)
+
+    # 4. Replay New Trace
+    trace_new = ctx.trace.copy()
+    for name, x_new in x_new_dict.items():
+        trace_new[name] = x_new
+    log_prob_new = _replay_trace(trace_new, ctx, current_move_index)
+
+    # 5. MH Step
+    # Assume symmetric proposal for now (Metropolis)
+    log_alpha = log_prob_new - log_prob_old
+
+    # Accept/Reject
+    log_u = torch.log(torch.rand(ctx.N, device=log_alpha.device))
+    accepted = log_u < log_alpha
+
+    # 6. Update Trace
+    # Use x_old shape of first variable to determine broadcasting of accepted mask?
+    # No, accepted is (N,). Need to broadcast per variable.
+
+    updated_values = []
+    for name in names:
+        x_old = x_old_dict[name]
+        x_new = x_new_dict[name]
+
+        view_shape = [ctx.N] + [1] * (x_old.ndim - 1)
+        acc_mask = accepted.view(*view_shape)
+
+        x_final = torch.where(acc_mask, x_new, x_old)
+
+        # Update in-place
+        ctx.trace[name][:] = x_final
+        updated_values.append(x_final)
+
+    if len(updated_values) == 1:
+        return updated_values[0]
+    else:
+        return tuple(updated_values)
+
+
 # -------------------------------------------------------------------------
 # Inference Loop
 # -------------------------------------------------------------------------
@@ -133,6 +247,9 @@ def run_smc(
                Also includes 'log_evidence' if not present in trace.
     """
     ctx = SMCContext(num_particles, ess_threshold)
+    ctx.model = model
+    ctx.args = args
+    ctx.kwargs = kwargs
 
     with SMCScope(ctx):
         model(*args, **kwargs)

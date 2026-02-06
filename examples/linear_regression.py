@@ -1,7 +1,15 @@
 import torch
 import torch.distributions as dist
 import matplotlib.pyplot as plt
-from weighted_sampling import run_smc, sample, observe, summary
+from weighted_sampling import (
+    run_smc,
+    sample,
+    observe,
+    summary,
+    move,
+    AdaptiveProposal,
+    RandomWalkProposal,
+)
 
 
 def model(data):
@@ -10,6 +18,7 @@ def model(data):
     for x, y in data:
         y_pred = a * x + b
         observe(y, dist.Normal(y_pred, 0.1))
+        move("a", "b", RandomWalkProposal(scale=0.1), threshold=0.5)
 
 
 def generate_synthetic_data(num_points=20):
@@ -63,5 +72,4 @@ plt.title("Linear Regression: True Line and Posterior Samples")
 plt.xlabel("x")
 plt.ylabel("y")
 plt.legend()
-plt.savefig("linear_regression_plot.png")
-print("Plot saved to linear_regression_plot.png")
+plt.savefig("examples/plots/linear_regression_plot.png")

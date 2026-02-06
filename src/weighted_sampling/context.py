@@ -1,6 +1,8 @@
 import threading
 import torch
+from typing import Optional, Callable, Tuple, Dict, Any
 from torch.distributions import Categorical
+from .distributions import as_weighted, WeightedDistribution
 
 # -------------------------------------------------------------------------
 # Global State Management
@@ -36,6 +38,57 @@ class SMCContext:
         self.trace = {}
         # Initialize weights to 0
         self.log_weights = torch.zeros(self.N)
+
+        # State to allow replay
+        self.model: Optional[Callable] = None
+        self.args: Tuple = ()
+        self.kwargs: Dict[str, Any] = {}
+
+        # Internal counter to track 'move' calls for robust replay alignment
+        self.move_counter = 0
+
+    def sample_site(
+        self, name: str, distribution: WeightedDistribution
+    ) -> torch.Tensor:
+        """
+        Standard SMC sampling logic.
+        """
+        # 1. Adapt and Sample (Vectorized)
+        w_dist = as_weighted(distribution)
+        x, log_w_inc = w_dist.sample_with_weight(self.N)
+
+        # 2. Update State
+        self.trace[name] = x
+        self.log_weights = self.log_weights + log_w_inc
+
+        # 3. Resample Check
+        self.resample_if_needed()
+
+        return x
+
+    def observe_site(self, value: torch.Tensor, distribution: WeightedDistribution):
+        """
+        Standard SMC observe logic.
+        """
+        w_dist = as_weighted(distribution)
+        log_w = w_dist.log_prob(value)
+
+        # Ensure log_w is compatible with (N,)
+        if log_w.ndim == 0:
+            self.log_weights = self.log_weights + log_w
+        elif log_w.shape[0] == self.N:
+            self.log_weights = self.log_weights + log_w
+        else:
+            # Handle shape mismatch manually
+            if log_w.shape[0] == 1:
+                self.log_weights = self.log_weights + log_w.expand(self.N)
+            else:
+                raise RuntimeError(
+                    f"Observed log_prob shape {log_w.shape} incompatible with particles N={self.N}"
+                )
+
+        # Resample Check
+        self.resample_if_needed()
 
     @property
     def log_evidence(self) -> torch.Tensor:
@@ -88,6 +141,65 @@ class SMCContext:
         # We reset to the average log-weight to preserve the total weight mass (and thus Log Z estimate).
         log_avg_w = self.log_evidence
         self.log_weights = log_avg_w.expand(self.N).clone()
+
+
+class StopReplay(Exception):
+    """Internal exception to stop model replay at a specific point."""
+
+    pass
+
+
+class ConditionedContext(SMCContext):
+    """
+    Context for replaying a trace to compute joint log-probability P(x, y).
+    Trace is fixed. Sampling sites turn into observation sites.
+    No resampling performed.
+    """
+
+    def __init__(
+        self, trace, num_particles: int, stop_at_move_index: Optional[int] = None
+    ):
+        super().__init__(num_particles, ess_threshold=-1.0)
+        # Deep copy traces to ensure no accidental mutations,
+        # though we shouldn't be mutating anyway in replay.
+        # Shallow copy of dict is enough if tensors are not mutated in place.
+        self.trace = trace.copy()
+        self.stop_at_move_index = stop_at_move_index
+
+        # Recalculate weights from scratch
+        # Represent log-probs of joint density
+        self.log_weights = torch.zeros(self.N)
+
+    def sample_site(
+        self, name: str, distribution: WeightedDistribution
+    ) -> torch.Tensor:
+        # 1. Retrieve fixed value
+        if name not in self.trace:
+            raise RuntimeError(f"Variable '{name}' not found in trace during replay.")
+        x = self.trace[name]
+
+        # 2. Compute Log Probability (Model Density)
+        w_dist = as_weighted(distribution)
+        log_prob = w_dist.log_prob(x)
+
+        # 3. Accumulate Weight
+        if log_prob.ndim == 0:
+            self.log_weights = self.log_weights + log_prob
+        elif log_prob.shape[0] == self.N:
+            self.log_weights = self.log_weights + log_prob
+        else:
+            # Broadcasting if needed
+            if log_prob.shape[0] == 1:
+                self.log_weights = self.log_weights + log_prob.expand(self.N)
+            else:
+                raise RuntimeError(
+                    f"Log prob shape {log_prob.shape} mismatch in replay."
+                )
+
+        return x
+
+    def resample_if_needed(self):
+        pass  # Disable resampling
 
 
 # -------------------------------------------------------------------------

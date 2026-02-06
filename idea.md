@@ -1,10 +1,10 @@
-Goal: Create a Pyro-like PPL for weighted sampling / sequential monte carlo using PyTorch. Users should be able to write models as standard python functions like
+Overview: A Pyro-like PPL for weighted sampling / sequential monte carlo using PyTorch. Users should be able to write models as standard python functions like
 
 ```python
-def model():
+def model(data):
     x = sample("x", dist(args...))
     y = sample("y", dist(args...))
-    observe(x, dist(args...))
+    observe(data, dist(x, ...))
 ```
 
 We then run the model by giving it as an argument to a inference function:
@@ -17,7 +17,7 @@ The inference function should maintain a global state that stores a trace which 
 
 The `sample` function should sample a new site from a `dist` object, append it to the trace, and return **only the samples**. The weights and trace are updated internally in the global state.
 
-The system will **wrap `torch.distributions`** (or use custom distribution classes). A `dist` object is responsible for generating samples and computing the incremental log-weights (importance weights). For standard distributions (proposal = target), the importance weight is 0. If doing importance sampling, the `dist` implementation handles the proposal logic internally.
+The system uses the **`WeightedDistribution` protocol** to interface with distributions. A `DistributionAdapter` wraps standard `torch.distributions,` handling broadcasting and incremental importance weights (which are 0 when proposal = target). Custom distributions (like `ImportanceSampler`) can be used to implement Importance Sampling by providing non-zero weights.
 
 The `observe` function should simply update the log-weights according to the log-pdf value.
 
@@ -55,9 +55,9 @@ To keep the user API clean (`x = sample(...)`), we use a **Global Context Stack*
 3. **Check ESS:** Checks the Effective Sample Size (ESS) against the threshold. If low, triggers **Resampling**.
 4. **Return:** Returns the sample tensor _only_.
 
-#### B. `observe(dist, data)` (or Weighted Sample)
+#### B. `observe(value, dist)` (or Weighted Sample)
 
-1. **Score:** Computes `log_w = dist.log_prob(data)`.
+1. **Score:** Computes `log_w = dist.log_prob(value)`.
 2. **Update:** Adds `log_w` to the global `log_weights`.
 3. **Check ESS:** Checks ESS against the configurable threshold. If low, triggers **Resampling**.
 
@@ -122,8 +122,8 @@ def sample(name, dist):
     ctx.resample_if_needed()
     return x
 
-def observe(dist, value):
-    ctx = _SMC_STACK.active_context
+def observe(value, dist):
+    ctx = get_active_context()
     # Compute weights
     log_w = dist.log_prob(value)
     ctx.log_weights += log_w
@@ -143,3 +143,41 @@ def run_smc(model_fn, N=1000, ess_threshold=0.5):
     return ctx.trace
 
 ```
+
+### 7. Feature RFC: Metropolis-Hastings Moves
+
+To improve sample diversity and mitigate degeneracy, we want to add an MCMC move step.
+
+**API:**
+
+```python
+move(name="x", proposal_fn=dist)
+```
+
+- Effect: Perturbs the existing variable `x` using a Metropolis-Hastings kernel leaving the target distribution invariant.
+- User Proposal: The user must provide a proposal distribution, e.g. `x_new ~ Normal(x_old, sigma)`.
+
+**Implementation Challenge: Computing Likelihoods**
+The primitive `sample("x")` usually has an importance weight of 0 (proposal=prior). The accumulated `log_weights` only track the observation likelihoods. To compute the MH acceptance ratio, we need the **full joint density** `P(x, y)` for both the old value and the proposed value.
+
+**Proposed Solution: Trace Replay**
+Since Python models are imperative, we cannot analytically determine which `observe` statements depend on `x`. We must "replay" the model.
+
+1.  **State Capture**: Save `ctx.model_fn` inside the context.
+2.  **Double Replay Algorithm**:
+    When `move("x")` is called:
+    a. **Propose**: Generate `x_new`.
+    b. **Replay Old**: Run the model from the start using a `ConditionedContext` where all `sample` sites return their _current_ trace values. - `sample` sites compute their `log_prob` (giving us `P(x_old)`). - `observe` sites compute `P(y|x_old)`. - Result: `log_prob_old` = `P(x, y)`.
+    c. **Replay New**: Run the model again using a `ConditionedContext`. - `sample("x")` assumes `x_new`. - Other sites use their original trace values. - Result: `log_prob_new` = `P(x', y)`.
+    d. **Accept/Reject**: Compute acceptance ratio `alpha` including the proposal density `Q(x'|x)` correction. Update `ctx.trace` and `ctx.log_weights` for accepted particles.
+
+**Optimization**:
+To avoid infinite recursion, `move` calls are ignored (no-op) during Replay execution.
+
+**Crucial Implementation Detail**:
+During replay, the `sample` primitive behaves differently. Standard SMC `sample` calls `dist.sample_with_weight()` which returns importance weights (often 0).
+In `ConditionedContext`, `sample` must:
+
+1. Retrieve the fixed value `x` from the trace.
+2. Call `dist.log_prob(x)` (not `sample_with_weight`) to compute the actual model density.
+3. Accumulate this `log_prob` into the context.

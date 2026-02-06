@@ -26,7 +26,7 @@ def model():
 
     # Observe Data
     # 'mu' is a tensor of shape (N,)
-    observe(dist.Normal(mu, 1.0), torch.tensor(5.0))
+    observe(torch.tensor(5.0), dist.Normal(mu, 1.0))
 
     return mu
 
@@ -44,7 +44,7 @@ def random_walk(data):
     x = sample("x_0", dist.Normal(0.0, 1.0))
     for t, y in enumerate(data):
         x = sample(f"x_{t+1}", dist.Normal(x, 1.0))
-        observe(dist.Normal(x, 0.5), y)
+        observe(y, dist.Normal(x, 0.5))
 ```
 
 ### 3. Importance Sampling
@@ -59,16 +59,74 @@ is_dist = ImportanceSampler(dist.Normal(3.0, 1.0), dist.Normal(0.0, 5.0))
 x = sample("x", is_dist)
 ```
 
-## Architecture
+### 4. Utility Functions
 
-- **Context Stack**: Uses `threading.local` global state to manage particle traces without passing state arguments.
-- **Resampling**: Checks ESS after every `sample` or `observe`. If `ESS < threshold * N`, it resamples ancestors and permutes the entire trace history.
+The library provides tools to analyze the results of the inference.
 
-## Installation
+**Summary Statistics:**
+
+```python
+from weighted_sampling import summary
+
+stats = summary(trace)
+print("Mean of x:", stats["x"]["mean"])
+print("Std Dev of x:", stats["x"]["std"])
+print("Effective unique particles:", stats["x"]["n_unique"])
+```
+
+**Expectations:**
+
+Calculate the weighted expectation of an arbitrary function of the latent variables.
+
+```python
+from weighted_sampling import expectation
+
+# Compute E[x^2]
+expected_sq = expectation(trace, lambda x: x ** 2)
+```
+
+### 5. Discrete Models
+
+For discrete Bayesian networks, you can use `DiscreteConditional` to define conditional probability tables efficiently.
+
+```python
+from weighted_sampling import DiscreteConditional
+
+# P(Cloudy)
+cloudy_dist = DiscreteConditional(lambda: [0.5, 0.5], domain_sizes=[])
+
+# P(Rain | Cloudy)
+def rain_probs(cloudy):
+    return [0.8, 0.2] if cloudy == 0 else [0.2, 0.8]
+
+rain_dist = DiscreteConditional(rain_probs, domain_sizes=[2])
+
+# In model:
+c = sample("cloudy", cloudy_dist())
+r = sample("rain", rain_dist(c))
+```
+
+### 6. Metropolis-Hastings Moves
+
+To improve sample diversity and mitigate degeneracy (particle collapse), you can apply MCMC moves to variables.
+
+````python
+from weighted_sampling import move, random_walk_proposal, adaptive_proposal
+
+def model_with_move():
+    x = sample("x", dist.Normal(0.0, 1.0))
+    observe(torch.tensor(5.0), dist.Normal(x, 0.1))
+
+    # 1. Simple Random Walk Proposal
+    move("x", random_walk_proposal(x, 0.5))
+
+    # 2. Or Adaptive Proposal based on particle covariance
+    # move("x", adaptive_proposal(x))
+
 
 ```bash
 pip install git+https://github.com/mariusfurter/WeightedSampling.torch.git
-```
+````
 
 ## Run tests
 

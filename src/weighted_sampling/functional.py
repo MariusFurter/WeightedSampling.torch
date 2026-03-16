@@ -2,8 +2,6 @@ import torch
 import inspect
 import torch.distributions as dists
 from typing import Callable, Any, Dict, Union, Tuple, Optional, List
-from tqdm import tqdm
-
 from .context import (
     SMCContext,
     SMCScope,
@@ -214,6 +212,8 @@ def run_smc(
 
     pbar = None
     if progress_bar:
+        from tqdm import tqdm
+
         pbar = tqdm(total=total_steps, desc="SMC Steps")
 
         def update_pbar():

@@ -1,5 +1,7 @@
 examples/plots/*
 !examples/plots/.gitkeep
+!examples/plots/linear_regression.png
+!examples/plots/state_space_model.png
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

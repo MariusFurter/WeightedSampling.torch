@@ -22,7 +22,7 @@ Requires Python ≥ 3.8 and PyTorch ≥ 1.10.
 
 ### Bayesian Linear Regression with MH Moves
 
-A complete example: infer slope and intercept from noisy data, using MCMC moves after each observation to maintain particle diversity.
+Infer slope and intercept from noisy data, using MCMC moves after each observation to maintain particle diversity.
 
 ```python
 import torch
@@ -39,25 +39,25 @@ def linear_regression(data):
 
 # Generate synthetic data: y = 2x - 1 + noise
 torch.manual_seed(0)
-xs = torch.linspace(0, 10, 20)
-ys = 2.0 * xs - 1.0 + 0.1 * torch.randn(20)
+xs = torch.linspace(0, 10, 10)
+ys = 2.0 * xs - 1.0 + 0.1 * torch.randn(10)
 data = list(zip(xs, ys))
 
 result = run_smc(linear_regression, data, num_particles=1000, ess_threshold=0.5)
-
 stats = summary(result)
 print(f"a: {stats['a']['mean']:.3f} ± {stats['a']['std']:.3f}")  # ≈ 2.0
 print(f"b: {stats['b']['mean']:.3f} ± {stats['b']['std']:.3f}")  # ≈ -1.0
-print(f"Log evidence: {result.log_evidence:.2f}")
 ```
+
+![Linear Regression](examples/plots/linear_regression.png)
+
+Full example with plotting: [examples/linear_regression.py](examples/linear_regression.py)
 
 ### State-Space Filtering
 
-Track a latent state through a sequence of noisy observations. Resampling is triggered automatically when the effective sample size drops.
+Track a latent AR(1) state through noisy observations. Resampling triggers automatically when the effective sample size drops.
 
 ```python
-import torch
-import torch.distributions as dist
 from weighted_sampling import run_smc, sample, observe, expectation
 
 def state_space_model(observations):
@@ -67,14 +67,14 @@ def state_space_model(observations):
         observe(y, dist.Normal(x, 0.5))
 
 result = run_smc(state_space_model, observations, num_particles=1000)
-
-# Posterior mean of the final state
-final = expectation(result, lambda **kw: kw["x_50"])
-print(f"Filtered state estimate: {final.item():.3f}")
 print(f"Log evidence: {result.log_evidence:.2f}")
 ```
 
+![State-Space Filtering](examples/plots/state_space_model.png)
+
 SMC computes the **marginal likelihood** $\hat{p}(\mathbf{y}_{1:T})$ as a byproduct of inference — useful for model comparison. On a linear-Gaussian model, this matches the exact Kalman filter solution (see [examples/verify_log_evidence.py](examples/verify_log_evidence.py)).
+
+Full example with data generation and plotting: [examples/state_space_model.py](examples/state_space_model.py)
 
 ## Features
 

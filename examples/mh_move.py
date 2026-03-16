@@ -1,3 +1,13 @@
+"""
+Effect of Metropolis-Hastings Moves
+====================================
+Compare SMC inference with and without MH rejuvenation moves
+on a model where the likelihood concentrates far from the prior.
+
+Without moves, resampling causes particle collapse (many duplicates).
+With moves, particles are diversified after resampling.
+"""
+
 import torch
 import torch.distributions as dist
 from weighted_sampling import (
@@ -7,62 +17,38 @@ from weighted_sampling import (
     move,
     summary,
     RandomWalkProposal,
-    AdaptiveProposal,
 )
 
 
-def simple_model_no_move():
-    x = sample("x", dist.Normal(0.0, 1.0))
-    # Make observing strong so we get collapse/weight variance
-    observe(torch.tensor(5.0), dist.Normal(x, 0.1))
-    return x
-
-
-def simple_model_with_move():
+def model_without_move():
     x = sample("x", dist.Normal(0.0, 1.0))
     observe(torch.tensor(5.0), dist.Normal(x, 0.1))
 
-    # At this point, weights are very unequal.
-    # If we forced resampling here, we would have duplicates.
-    # But run_smc handles resampling.
-    # Let's apply move.
+
+def model_with_move():
+    x = sample("x", dist.Normal(0.0, 1.0))
+    observe(torch.tensor(5.0), dist.Normal(x, 0.1))
     move("x", RandomWalkProposal(scale=0.5))
-    return x
-
-
-def test_mh():
-    torch.manual_seed(42)
-    N = 100
-
-    print("Running without move...")
-    trace1 = run_smc(simple_model_no_move, num_particles=N)  # Resampling likely happens
-    stats1 = summary(trace1)
-    print(
-        f"Mean: {stats1['x']['mean']:.4f}, Std: {stats1['x']['std']:.4f}, Unique: {stats1['x']['n_unique']}"
-    )
-
-    torch.manual_seed(42)
-    print("\nRunning with move...")
-    trace2 = run_smc(simple_model_with_move, num_particles=N)
-    stats2 = summary(trace2)
-    print(
-        f"Mean: {stats2['x']['mean']:.4f}, Std: {stats2['x']['std']:.4f}, Unique: {stats2['x']['n_unique']}"
-    )
-
-    # We expect 'with move' to have more unique particles if resampling caused collapse,
-    # OR broadly similar stats but different values.
-    # Note: 'move' is applied AFTER observe.
-    # Observe updates weights.
-    # If we don't resample, updates weights.
-    # Move doesn't change weights.
-
-    # If no resampling happened:
-    # unique1 = 100
-    # unique2 = 100 (but moved positions).
-
-    # To force collapse, we can inject a manual resample or use very low ESS threshold?
-    # Or just loop.
 
 
 if __name__ == "__main__":
-    test_mh()
+    N = 500
+    torch.manual_seed(42)
+
+    # Without MH move
+    result_no_move = run_smc(model_without_move, num_particles=N)
+    stats_no = summary(result_no_move)
+
+    # With MH move
+    torch.manual_seed(42)
+    result_with_move = run_smc(model_with_move, num_particles=N)
+    stats_with = summary(result_with_move)
+
+    print("Without MH move:")
+    print(
+        f"  Mean: {stats_no['x']['mean']:.4f}  Std: {stats_no['x']['std']:.4f}  Unique particles: {stats_no['x']['n_unique']}"
+    )
+    print("\nWith MH move:")
+    print(
+        f"  Mean: {stats_with['x']['mean']:.4f}  Std: {stats_with['x']['std']:.4f}  Unique particles: {stats_with['x']['n_unique']}"
+    )

@@ -11,7 +11,7 @@ With moves, particles are diversified after resampling.
 import torch
 import torch.distributions as dist
 from weighted_sampling import (
-    run_smc,
+    model,
     sample,
     observe,
     move,
@@ -20,12 +20,14 @@ from weighted_sampling import (
 )
 
 
-def model_without_move():
+@model
+def without_move():
     x = sample("x", dist.Normal(0.0, 1.0))
     observe(torch.tensor(5.0), dist.Normal(x, 0.1))
 
 
-def model_with_move():
+@model
+def with_move():
     x = sample("x", dist.Normal(0.0, 1.0))
     observe(torch.tensor(5.0), dist.Normal(x, 0.1))
     move("x", RandomWalkProposal(scale=0.5))
@@ -36,12 +38,12 @@ if __name__ == "__main__":
     torch.manual_seed(42)
 
     # Without MH move
-    result_no_move = run_smc(model_without_move, num_particles=N)
+    result_no_move = without_move(num_particles=N)
     stats_no = summary(result_no_move)
 
     # With MH move
     torch.manual_seed(42)
-    result_with_move = run_smc(model_with_move, num_particles=N)
+    result_with_move = with_move(num_particles=N)
     stats_with = summary(result_with_move)
 
     print("Without MH move:")

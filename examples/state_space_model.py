@@ -15,12 +15,13 @@ Generates: examples/plots/state_space_model.png
 import torch
 import torch.distributions as dist
 import matplotlib.pyplot as plt
-from weighted_sampling import run_smc, sample, observe, expectation
+from weighted_sampling import model, sample, observe, expectation
 
 
 # ---- Model ----
 
 
+@model
 def state_space_model(observations):
     x = sample("x_0", dist.Normal(0.0, 1.0))
     for t, y in enumerate(observations):
@@ -105,7 +106,7 @@ def plot_results(result, observations, true_states):
 if __name__ == "__main__":
     observations, true_states = make_data(T=50)
 
-    result = run_smc(state_space_model, observations, num_particles=1000)
+    result = state_space_model(observations, num_particles=1000)
     print(f"Log evidence: {result.log_evidence:.2f}")
 
     plot_results(result, observations, true_states)

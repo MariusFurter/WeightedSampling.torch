@@ -12,7 +12,7 @@ Domains: 0 = False, 1 = True
 """
 
 import torch
-from weighted_sampling import run_smc, sample, observe, summary, DiscreteConditional
+from weighted_sampling import model, sample, observe, summary, DiscreteConditional
 
 
 # ---- Conditional probability tables ----
@@ -62,6 +62,7 @@ cpts = {
 # ---- Model ----
 
 
+@model
 def wet_grass_model():
     c = sample("cloudy", cpts["cloudy"]())
     s = sample("sprinkler", cpts["sprinkler"](c))
@@ -74,7 +75,7 @@ def wet_grass_model():
 # ---- Main ----
 
 if __name__ == "__main__":
-    result = run_smc(wet_grass_model, num_particles=10_000)
+    result = wet_grass_model(num_particles=10_000)
 
     stats = summary(result)
     print("Posterior given WetGrass = True:")

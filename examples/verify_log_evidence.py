@@ -13,12 +13,13 @@ Model:
 import math
 import torch
 import torch.distributions as dist
-from weighted_sampling import run_smc, sample, observe
+from weighted_sampling import model, sample, observe
 
 
 # ---- SMC model ----
 
 
+@model
 def smc_model(data):
     x = sample("x_init", dist.Normal(0, 1))
     for t, y_val in enumerate(data):
@@ -82,7 +83,7 @@ if __name__ == "__main__":
 
     # SMC estimate
     torch.manual_seed(100)
-    result = run_smc(smc_model, data, num_particles=1000)
+    result = smc_model(data, num_particles=1000)
     smc = result["log_evidence"].item()
 
     # Compare

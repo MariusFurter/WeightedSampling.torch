@@ -6,7 +6,7 @@
 
 A lightweight probabilistic programming library for **Sequential Monte Carlo** in PyTorch.
 
-Models are defined as standard Python functions. All particles execute the model simultaneously through PyTorch broadcasting, requiring no manual loops or specialized syntax. The library provides SMC inference with adaptive resampling, Metropolis-Hastings rejuvenation moves, and automatic marginal likelihood estimation.
+Models are defined as standard Python functions using the `@model` decorator. All particles execute the model simultaneously through PyTorch broadcasting, requiring no manual loops or specialized syntax. The library provides SMC inference with adaptive resampling, Metropolis-Hastings rejuvenation moves, and automatic marginal likelihood estimation.
 
 > Also available in Julia: [WeightedSampling.jl](https://github.com/MariusFurter/WeightedSampling.jl)
 
@@ -27,9 +27,10 @@ Infer slope and intercept from noisy data, using MCMC moves after each observati
 ```python
 import torch
 import torch.distributions as dist
-from weighted_sampling import run_smc, sample, observe, move, summary
+from weighted_sampling import model, sample, observe, move, summary
 from weighted_sampling import RandomWalkProposal
 
+@model
 def linear_regression(data):
     a = sample("a", dist.Normal(0, 5))
     b = sample("b", dist.Normal(0, 5))
@@ -43,7 +44,7 @@ xs = torch.linspace(0, 10, 10)
 ys = 2.0 * xs - 1.0 + 0.1 * torch.randn(10)
 data = list(zip(xs, ys))
 
-result = run_smc(linear_regression, data, num_particles=1000, ess_threshold=0.5)
+result = linear_regression(data, num_particles=1000, ess_threshold=0.5)
 stats = summary(result)
 print(f"a: {stats['a']['mean']:.3f} ± {stats['a']['std']:.3f}")  # ≈ 2.0
 print(f"b: {stats['b']['mean']:.3f} ± {stats['b']['std']:.3f}")  # ≈ -1.0
@@ -58,15 +59,16 @@ Full example with plotting: [examples/linear_regression.py](examples/linear_regr
 Track a latent AR(1) state through noisy observations. Resampling triggers automatically when the effective sample size drops.
 
 ```python
-from weighted_sampling import run_smc, sample, observe, expectation
+from weighted_sampling import model, sample, observe, expectation
 
+@model
 def state_space_model(observations):
     x = sample("x_0", dist.Normal(0.0, 1.0))
     for t, y in enumerate(observations):
         x = sample(f"x_{t+1}", dist.Normal(0.8 * x, 0.5))
         observe(y, dist.Normal(x, 0.5))
 
-result = run_smc(state_space_model, observations, num_particles=1000)
+result = state_space_model(observations, num_particles=1000)
 print(f"Log evidence: {result.log_evidence:.2f}")
 ```
 
@@ -93,17 +95,18 @@ Full example with data generation and plotting: [examples/state_space_model.py](
 Use a proposal distribution different from the target to improve sampling efficiency.
 
 ```python
-from weighted_sampling import run_smc, sample, expectation, ImportanceSampler
+from weighted_sampling import model, sample, expectation, ImportanceSampler
 import torch.distributions as dist
 
-def model():
+@model
+def importance_sampling_example():
     # Sample from Normal(0, 5) proposal, weight toward Normal(3, 1) target
     x = sample("x", ImportanceSampler(
         target=dist.Normal(3.0, 1.0),
         proposal=dist.Normal(0.0, 5.0),
     ))
 
-result = run_smc(model, num_particles=10_000)
+result = importance_sampling_example(num_particles=10_000)
 print(f"E[x] = {expectation(result, lambda x: x).item():.3f}")  # ≈ 3.0
 ```
 
@@ -112,7 +115,7 @@ print(f"E[x] = {expectation(result, lambda x: x).item():.3f}")  # ≈ 3.0
 Define conditional probability tables for discrete variables.
 
 ```python
-from weighted_sampling import run_smc, sample, observe, summary, DiscreteConditional
+from weighted_sampling import model, sample, observe, summary, DiscreteConditional
 
 cloudy_cpt = DiscreteConditional(lambda: [0.5, 0.5], domain_sizes=[])
 rain_cpt = DiscreteConditional(
@@ -123,40 +126,23 @@ sprinkler_cpt = DiscreteConditional(
     lambda c: [0.9, 0.1] if c == 1 else [0.5, 0.5],
     domain_sizes=[2],
 )
+wet_grass_cpt = DiscreteConditional(
+    lambda s, r: [0.01, 0.99] if s == 1 and r == 1
+           else [0.1, 0.9]  if s == 1 or r == 1
+           else [1.0, 0.0],
+    domain_sizes=[2, 2],
+)
 
+@model
 def wet_grass_model():
     c = sample("cloudy", cloudy_cpt())
     r = sample("rain", rain_cpt(c))
     s = sample("sprinkler", sprinkler_cpt(c))
-    # Observe: the grass is wet
-    observe(torch.tensor(1), DiscreteConditional(
-        lambda s, r: [0.01, 0.99] if s == 1 and r == 1
-                 else [0.1, 0.9]  if s == 1 or r == 1
-                 else [1.0, 0.0],
-        domain_sizes=[2, 2],
-    )(s, r))
+    observe(torch.tensor(1), wet_grass_cpt(s, r))
 
-result = run_smc(wet_grass_model, num_particles=10_000)
+result = wet_grass_model(num_particles=10_000)
 stats = summary(result)
 print(f"P(Rain | wet grass) ≈ {stats['rain']['mean']:.3f}")
-```
-
-### Model Decorator
-
-The `@model` decorator lets you call a model function directly with inference parameters.
-
-```python
-from weighted_sampling import model, sample, observe
-import torch
-import torch.distributions as dist
-
-@model
-def gaussian(data):
-    mu = sample("mu", dist.Normal(0.0, 10.0))
-    for y in data:
-        observe(y, dist.Normal(mu, 1.0))
-
-result = gaussian(data, num_particles=1000, ess_threshold=0.5)
 ```
 
 ## Analysis Utilities

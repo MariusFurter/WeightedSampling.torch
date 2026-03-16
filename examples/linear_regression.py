@@ -12,7 +12,7 @@ import torch.distributions as dist
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
 from weighted_sampling import (
-    run_smc,
+    model,
     sample,
     observe,
     summary,
@@ -24,6 +24,7 @@ from weighted_sampling import (
 # ---- Model ----
 
 
+@model
 def linear_regression(data):
     a = sample("a", dist.Normal(0, 5))
     b = sample("b", dist.Normal(0, 5))
@@ -106,7 +107,7 @@ if __name__ == "__main__":
     true_a, true_b = 2.0, -1.0
     data, xs = make_data(true_a=true_a, true_b=true_b)
 
-    result = run_smc(linear_regression, data, num_particles=1000, ess_threshold=0.5)
+    result = linear_regression(data, num_particles=1000, ess_threshold=0.5)
 
     stats = summary(result)
     print(f"a: {stats['a']['mean']:.3f} ± {stats['a']['std']:.3f}  (true: {true_a})")

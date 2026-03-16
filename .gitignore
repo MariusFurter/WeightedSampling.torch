@@ -1,4 +1,5 @@
-examples/plots
+examples/plots/*
+!examples/plots/.gitkeep
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

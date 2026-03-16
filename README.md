@@ -1,16 +1,14 @@
 # WeightedSampling.torch
 
-A lightweight, vectorized Probabilistic Programming Language (PPL) for Sequential Monte Carlo (SMC) in PyTorch.
+[![Tests](https://github.com/mariusfurter/WeightedSampling.torch/actions/workflows/test.yml/badge.svg)](https://github.com/mariusfurter/WeightedSampling.torch/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
 
-## Features
+A lightweight probabilistic programming library for **Sequential Monte Carlo** in PyTorch.
 
-- **Vectorized Execution**: All $N$ particles run the same model function simultaneously via PyTorch broadcasting — no Python loops over particles.
-- **Sequential Monte Carlo**: ESS-triggered multinomial resampling keeps the particle population healthy across sequential observations.
-- **Metropolis-Hastings Moves**: `RandomWalkProposal` and `AdaptiveProposal` (AM with particle-estimated covariance) rejuvenate particles after resampling.
-- **Importance Sampling**: Plug in a separate proposal via `ImportanceSampler`; log-importance weights are accumulated automatically.
-- **Discrete Models**: `DiscreteConditional` provides lazy, memoized conditional probability tables for discrete Bayesian networks.
-- **PyTorch Integration**: Works with any `torch.distributions.Distribution` out of the box.
-- **Analysis Utilities**: `expectation` and `summary` compute weighted posterior statistics from results.
+Models are defined as standard Python functions. All particles execute the model simultaneously through PyTorch broadcasting, requiring no manual loops or specialized syntax. The library provides SMC inference with adaptive resampling, Metropolis-Hastings rejuvenation moves, and automatic marginal likelihood estimation.
+
+> Also available in Julia: [WeightedSampling.jl](https://github.com/MariusFurter/WeightedSampling.jl)
 
 ## Installation
 
@@ -18,151 +16,184 @@ A lightweight, vectorized Probabilistic Programming Language (PPL) for Sequentia
 pip install git+https://github.com/mariusfurter/WeightedSampling.torch.git
 ```
 
-## Usage
+Requires Python ≥ 3.8 and PyTorch ≥ 1.10.
 
-### 1. Simple Inference
+## Quick Start
 
-Define a model as a standard Python function using `sample` and `observe`.
+### Bayesian Linear Regression with MH Moves
+
+A complete example: infer slope and intercept from noisy data, using MCMC moves after each observation to maintain particle diversity.
+
+```python
+import torch
+import torch.distributions as dist
+from weighted_sampling import run_smc, sample, observe, move, summary
+from weighted_sampling import RandomWalkProposal
+
+def linear_regression(data):
+    a = sample("a", dist.Normal(0, 5))
+    b = sample("b", dist.Normal(0, 5))
+    for x, y in data:
+        observe(y, dist.Normal(a * x + b, 0.1))
+        move(["a", "b"], RandomWalkProposal(scale=0.1), threshold=0.5)
+
+# Generate synthetic data: y = 2x - 1 + noise
+torch.manual_seed(0)
+xs = torch.linspace(0, 10, 20)
+ys = 2.0 * xs - 1.0 + 0.1 * torch.randn(20)
+data = list(zip(xs, ys))
+
+result = run_smc(linear_regression, data, num_particles=1000, ess_threshold=0.5)
+
+stats = summary(result)
+print(f"a: {stats['a']['mean']:.3f} ± {stats['a']['std']:.3f}")  # ≈ 2.0
+print(f"b: {stats['b']['mean']:.3f} ± {stats['b']['std']:.3f}")  # ≈ -1.0
+print(f"Log evidence: {result.log_evidence:.2f}")
+```
+
+### State-Space Filtering
+
+Track a latent state through a sequence of noisy observations. Resampling is triggered automatically when the effective sample size drops.
 
 ```python
 import torch
 import torch.distributions as dist
 from weighted_sampling import run_smc, sample, observe, expectation
 
-def my_model():
-    # Define Prior
-    # Scalar params are automatically broadcast to N particles
-    mu = sample("mu", dist.Normal(0.0, 10.0))
-
-    # Observe Data
-    # 'mu' is a tensor of shape (N,)
-    observe(torch.tensor(5.0), dist.Normal(mu, 1.0))
-
-# Run Inference
-result = run_smc(my_model, num_particles=1000)
-
-# Compute weighted posterior mean
-print("Posterior Mean:", expectation(result, lambda mu: mu).item())
-```
-
-### 2. Sequential Models (Random Walk)
-
-Models can run loops. Resampling is triggered automatically when Effective Sample Size (ESS) drops.
-
-```python
-def random_walk(data):
+def state_space_model(observations):
     x = sample("x_0", dist.Normal(0.0, 1.0))
-    for t, y in enumerate(data):
-        x = sample(f"x_{t+1}", dist.Normal(x, 1.0))
+    for t, y in enumerate(observations):
+        x = sample(f"x_{t+1}", dist.Normal(0.8 * x, 0.5))
         observe(y, dist.Normal(x, 0.5))
+
+result = run_smc(state_space_model, observations, num_particles=1000)
+
+# Posterior mean of the final state
+final = expectation(result, lambda **kw: kw["x_50"])
+print(f"Filtered state estimate: {final.item():.3f}")
+print(f"Log evidence: {result.log_evidence:.2f}")
 ```
 
-### 3. Importance Sampling
+SMC computes the **marginal likelihood** $\hat{p}(\mathbf{y}_{1:T})$ as a byproduct of inference — useful for model comparison. On a linear-Gaussian model, this matches the exact Kalman filter solution (see [examples/verify_log_evidence.py](examples/verify_log_evidence.py)).
 
-You can use a proposal distribution different from the target.
+## Features
+
+- **Vectorized execution** — all $N$ particles run the model simultaneously via PyTorch broadcasting. No Python loops over particles.
+- **Adaptive resampling** — multinomial resampling triggers when ESS falls below a configurable threshold.
+- **MH rejuvenation moves** — `RandomWalkProposal` and `AdaptiveProposal` (Adaptive Metropolis with particle-estimated covariance) combat particle degeneracy.
+- **Importance sampling** — use `ImportanceSampler` to sample from a proposal different from the prior.
+- **Discrete models** — `DiscreteConditional` provides lazy, memoized conditional probability tables for Bayesian networks.
+- **Log evidence** — marginal likelihood $\hat{p}(\mathbf{y})$ computed automatically during inference.
+- **Works with `torch.distributions`** — any standard PyTorch distribution works out of the box.
+
+## More Examples
+
+### Importance Sampling
+
+Use a proposal distribution different from the target to improve sampling efficiency.
 
 ```python
 from weighted_sampling import run_smc, sample, expectation, ImportanceSampler
 import torch.distributions as dist
 
-def my_model():
-    # Target: Normal(3, 1), Proposal: Normal(0, 5)
-    is_dist = ImportanceSampler(dist.Normal(3.0, 1.0), dist.Normal(0.0, 5.0))
-    sample("x", is_dist)
+def model():
+    # Sample from Normal(0, 5) proposal, weight toward Normal(3, 1) target
+    x = sample("x", ImportanceSampler(
+        target=dist.Normal(3.0, 1.0),
+        proposal=dist.Normal(0.0, 5.0),
+    ))
 
-result = run_smc(my_model, num_particles=10000)
-print("Mean:", expectation(result, lambda x: x).item())  # ≈ 3.0
+result = run_smc(model, num_particles=10_000)
+print(f"E[x] = {expectation(result, lambda x: x).item():.3f}")  # ≈ 3.0
 ```
 
-### 4. Utility Functions
+### Discrete Bayesian Network
 
-The library provides tools to analyze the results of the inference.
-
-**Summary Statistics:**
+Define conditional probability tables for discrete variables.
 
 ```python
-from weighted_sampling import summary
+from weighted_sampling import run_smc, sample, observe, summary, DiscreteConditional
 
-stats = summary(trace)
-print("Mean of x:", stats["x"]["mean"])
-print("Std Dev of x:", stats["x"]["std"])
-print("Effective unique particles:", stats["x"]["n_unique"])
+cloudy_cpt = DiscreteConditional(lambda: [0.5, 0.5], domain_sizes=[])
+rain_cpt = DiscreteConditional(
+    lambda c: [0.2, 0.8] if c == 1 else [0.8, 0.2],
+    domain_sizes=[2],
+)
+sprinkler_cpt = DiscreteConditional(
+    lambda c: [0.9, 0.1] if c == 1 else [0.5, 0.5],
+    domain_sizes=[2],
+)
+
+def wet_grass_model():
+    c = sample("cloudy", cloudy_cpt())
+    r = sample("rain", rain_cpt(c))
+    s = sample("sprinkler", sprinkler_cpt(c))
+    # Observe: the grass is wet
+    observe(torch.tensor(1), DiscreteConditional(
+        lambda s, r: [0.01, 0.99] if s == 1 and r == 1
+                 else [0.1, 0.9]  if s == 1 or r == 1
+                 else [1.0, 0.0],
+        domain_sizes=[2, 2],
+    )(s, r))
+
+result = run_smc(wet_grass_model, num_particles=10_000)
+stats = summary(result)
+print(f"P(Rain | wet grass) ≈ {stats['rain']['mean']:.3f}")
 ```
 
-**Expectations:**
+### Model Decorator
 
-Calculate the weighted expectation of an arbitrary function of the latent variables.
-
-```python
-from weighted_sampling import expectation
-
-# Compute E[x^2]
-expected_sq = expectation(trace, lambda x: x ** 2)
-```
-
-### 5. Discrete Models
-
-For discrete Bayesian networks, you can use `DiscreteConditional` to define conditional probability tables efficiently.
+The `@model` decorator lets you call a model function directly with inference parameters.
 
 ```python
-from weighted_sampling import DiscreteConditional
-
-# P(Cloudy)
-cloudy_dist = DiscreteConditional(lambda: [0.5, 0.5], domain_sizes=[])
-
-# P(Rain | Cloudy)
-def rain_probs(cloudy):
-    return [0.8, 0.2] if cloudy == 0 else [0.2, 0.8]
-
-rain_dist = DiscreteConditional(rain_probs, domain_sizes=[2])
-
-# In model:
-c = sample("cloudy", cloudy_dist())
-r = sample("rain", rain_dist(c))
-```
-
-### 6. Metropolis-Hastings Moves
-
-To improve sample diversity and mitigate degeneracy (particle collapse), you can apply MCMC moves to variables.
-
-```python
-from weighted_sampling import sample, observe, move, run_smc
-from weighted_sampling import RandomWalkProposal, AdaptiveProposal
+from weighted_sampling import model, sample, observe
 import torch
 import torch.distributions as dist
 
-def model_with_move():
-    x = sample("x", dist.Normal(0.0, 1.0))
-    observe(torch.tensor(5.0), dist.Normal(x, 0.1))
-
-    # 1. Simple Random Walk Proposal
-    move("x", RandomWalkProposal(scale=0.1))
-
-    # 2. Or Adaptive Proposal based on particle covariance
-    # move("x", AdaptiveProposal())
-```
-
-> **Note on Variable Names During Moves:** When using `move`, the model is replayed to compute acceptance ratios. Variable names must be unique within a single model execution once a move is initiated. Overwriting a variable name (e.g. `x = sample("val", ...); x = sample("val", ...)`) is forbidden and will raise a `ValueError`.
-
-### 7. Model Decorator
-
-The `@model` decorator allows a model function to be called directly with SMC arguments.
-
-```python
-from weighted_sampling import model
-import torch.distributions as dist
-
 @model
-def my_model(data):
+def gaussian(data):
     mu = sample("mu", dist.Normal(0.0, 10.0))
     for y in data:
         observe(y, dist.Normal(mu, 1.0))
 
-result = my_model(data, num_particles=1000, ess_threshold=0.5)
+result = gaussian(data, num_particles=1000, ess_threshold=0.5)
 ```
 
-## Run tests
+## Analysis Utilities
+
+`summary` returns weighted mean, standard deviation, and particle diversity for each variable:
+
+```python
+stats = summary(result)
+print(stats["a"]["mean"], stats["a"]["std"], stats["a"]["n_unique"])
+```
+
+`expectation` computes $\mathbb{E}[f(\mathbf{x})]$ under the weighted posterior. The function signature determines which variables are passed:
+
+```python
+# E[a * b]
+expectation(result, lambda a, b: a * b)
+
+# E[x^2]
+expectation(result, lambda x: x ** 2)
+```
+
+## API Note: Variable Names and Moves
+
+When using `move`, the model is replayed internally to compute MH acceptance ratios. This requires that every `sample` site has a **unique name** within a single model execution. Reusing a name (e.g. `sample("x", ...); sample("x", ...)`) will raise a `ValueError`.
+
+Sequential models naturally avoid this by indexing names: `sample(f"x_{t}", ...)`.
+
+## Tests
 
 ```bash
-pytest tests/
+pytest tests/ -v
 ```
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+## License
+
+MIT — see [LICENSE](LICENSE) for details.

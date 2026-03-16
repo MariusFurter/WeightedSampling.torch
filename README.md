@@ -92,7 +92,7 @@ Full example with data generation and plotting: [examples/state_space_model.py](
 
 ### Importance Sampling
 
-Use a proposal distribution different from the target to improve sampling efficiency.
+Use a proposal distribution different from the target. `proposal` needs `sample` and `log_prob`; `target` only needs `log_prob` (can be unnormalized).
 
 ```python
 from weighted_sampling import model, sample, expectation, ImportanceSampler

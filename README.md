@@ -166,9 +166,7 @@ expectation(result, lambda x: x ** 2)
 
 ## API Note: Variable Names and Moves
 
-When using `move`, the model is replayed internally to compute MH acceptance ratios. This requires that every `sample` site has a **unique name** within a single model execution. Reusing a name (e.g. `sample("x", ...); sample("x", ...)`) will raise a `ValueError`.
-
-Sequential models naturally avoid this by indexing names: `sample(f"x_{t}", ...)`.
+Duplicate names in `sample` sites silently overwrite earlier values. This can be useful for only retaining relevant variables in the trace. When using `move`, duplicate names are **not allowed** and will raise a `ValueError`.
 
 ## Tests
 

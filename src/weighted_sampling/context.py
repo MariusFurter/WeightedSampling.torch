@@ -21,12 +21,118 @@ def get_active_context():
     return ctx
 
 
+class PackedTrace:
+    """
+    A packed tensor store for SMC trace variables.
+
+    Scalar (N,) and vector (N, D) variables are packed into a single
+    contiguous (N, capacity) buffer so that resampling all variables
+    becomes a single indexed-copy instead of a per-variable loop.
+
+    Variables with 3+ event dimensions (rare) fall back to a secondary dict.
+    Supports a dict-like interface for transparent use.
+    """
+
+    def __init__(self, num_particles: int, capacity: int = 0):
+        self.N = num_particles
+        self._buffer = torch.zeros(num_particles, capacity)
+        self._used = 0
+        self._registry: Dict[str, Tuple[int, int, tuple]] = {}
+        self._order: List[str] = []
+        self._overflow: Dict[str, torch.Tensor] = {}
+
+    @property
+    def columns_used(self) -> int:
+        return self._used
+
+    def _can_pack(self, value: torch.Tensor) -> bool:
+        if value.ndim > 2:
+            return False
+        flat = value[0].numel() if value.ndim > 1 else 1
+        return self._used + flat <= self._buffer.shape[1]
+
+    def __setitem__(self, name: str, value: torch.Tensor):
+        if name in self._registry:
+            start, end, _ = self._registry[name]
+            if end - start == 1:
+                self._buffer[:, start] = value.reshape(self.N)
+            else:
+                self._buffer[:, start:end] = value.reshape(self.N, -1)
+            return
+
+        if name in self._overflow:
+            self._overflow[name] = value
+            return
+
+        # New variable
+        if self._can_pack(value):
+            flat = value[0].numel() if value.ndim > 1 else 1
+            start = self._used
+            end = start + flat
+            self._registry[name] = (start, end, value.shape[1:])
+            if flat == 1:
+                self._buffer[:, start] = value.reshape(self.N)
+            else:
+                self._buffer[:, start:end] = value.reshape(self.N, -1)
+            self._used = end
+        else:
+            self._overflow[name] = value.clone()
+        self._order.append(name)
+
+    def __getitem__(self, name: str) -> torch.Tensor:
+        if name in self._registry:
+            start, end, event_shape = self._registry[name]
+            if not event_shape:
+                return self._buffer[:, start]
+            return self._buffer[:, start:end]
+        if name in self._overflow:
+            return self._overflow[name]
+        raise KeyError(name)
+
+    def __contains__(self, name) -> bool:
+        return name in self._registry or name in self._overflow
+
+    def __len__(self) -> int:
+        return len(self._order)
+
+    def __iter__(self):
+        return iter(self._order)
+
+    def keys(self):
+        return iter(self._order)
+
+    def values(self):
+        for name in self._order:
+            yield self[name]
+
+    def items(self):
+        for name in self._order:
+            yield name, self[name]
+
+    def get(self, name, default=None):
+        if name in self:
+            return self[name]
+        return default
+
+    def copy(self) -> Dict[str, torch.Tensor]:
+        """Return a shallow dict snapshot (buffer vars are views, not copies)."""
+        return {name: self[name] for name in self._order}
+
+    def resample(self, ancestors: torch.Tensor):
+        """Resample all variables using ancestor indices — O(1) for packed vars."""
+        if self._used > 0:
+            self._buffer[:, : self._used] = self._buffer[ancestors, : self._used]
+        for name in self._overflow:
+            t = self._overflow[name]
+            t[:] = t[ancestors]
+
+
 class SMCContext:
     """
     Manages the state of the Sequential Monte Carlo execution.
     storage:
-        trace: dict[str, Tensor] - Stores the history of sampled variables.
-                                   Shape: (N, ...)
+        trace: PackedTrace       - Stores the history of sampled variables.
+                                   Shape per variable: (N, ...)
         log_weights: Tensor      - Current log-importance weights for each particle.
                                    Shape: (N,)
     """
@@ -37,12 +143,14 @@ class SMCContext:
         ess_threshold: float = 0.5,
         track_joint: bool = False,
         debug: bool = False,
+        trace_capacity: Optional[int] = None,
     ):
         self.N = num_particles
         self.ess_threshold = ess_threshold
         self.track_joint = track_joint
         self.debug = debug
-        self.trace = {}
+        capacity = trace_capacity if trace_capacity is not None else 256
+        self.trace = PackedTrace(self.N, capacity)
         # Initialize weights to 0
         self.log_weights = torch.zeros(self.N)
         # Track joint log-probability P(x,y) separately to optimize MH moves
@@ -87,7 +195,7 @@ class SMCContext:
         # 3. Resample Check
         self.resample_if_needed()
 
-        return x
+        return self.trace[name]
 
     def observe_site(self, value: torch.Tensor, distribution: WeightedDistribution):
         """
@@ -141,7 +249,7 @@ class SMCContext:
             x = x.unsqueeze(0).expand(self.N, *x.shape)
 
         self.trace[name] = x
-        return x
+        return self.trace[name]
 
     @property
     def log_evidence(self) -> torch.Tensor:
@@ -358,10 +466,8 @@ class SMCContext:
         weights = torch.softmax(self.log_weights, dim=0)
         ancestors = torch.multinomial(weights, self.N, replacement=True)
 
-        # 2. Permute History
-        for tensor in self.trace.values():
-            # In-place update to keep local variables in model synced with trace
-            tensor[:] = tensor[ancestors]
+        # 2. Permute History (bulk operation on packed buffer)
+        self.trace.resample(ancestors)
 
         # Permute log_joint
         if self.track_joint:
@@ -389,10 +495,10 @@ class ConditionedContext(SMCContext):
     def __init__(
         self, trace, num_particles: int, stop_at_move_index: Optional[int] = None
     ):
-        super().__init__(num_particles, ess_threshold=-1.0, track_joint=False)
-        # Deep copy traces to ensure no accidental mutations,
-        # though we shouldn't be mutating anyway in replay.
-        # Shallow copy of dict is enough if tensors are not mutated in place.
+        super().__init__(
+            num_particles, ess_threshold=-1.0, track_joint=False, trace_capacity=0
+        )
+        # Replay contexts use a plain dict — no resampling, no need for packed buffer.
         self.trace = trace.copy()
         self.stop_at_move_index = stop_at_move_index
         self.visited = set()

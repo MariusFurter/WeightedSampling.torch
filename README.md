@@ -4,10 +4,19 @@ A lightweight, vectorized Probabilistic Programming Language (PPL) for Sequentia
 
 ## Features
 
-- **Vectorized Execution**: All particles are processed in parallel using PyTorch broadcasting ("Single Instruction, Multiple Data").
-- **Sequential Monte Carlo**: Supports standard SMC with configurable resampling.
-- **PyTorch Integration**: Built on top of `torch.distributions`.
-- **Custom Inference**: Supports arbitrary importance sampling proposals via `WeightedDistribution`.
+- **Vectorized Execution**: All $N$ particles run the same model function simultaneously via PyTorch broadcasting — no Python loops over particles.
+- **Sequential Monte Carlo**: ESS-triggered multinomial resampling keeps the particle population healthy across sequential observations.
+- **Metropolis-Hastings Moves**: `RandomWalkProposal` and `AdaptiveProposal` (AM with particle-estimated covariance) rejuvenate particles after resampling.
+- **Importance Sampling**: Plug in a separate proposal via `ImportanceSampler`; log-importance weights are accumulated automatically.
+- **Discrete Models**: `DiscreteConditional` provides lazy, memoized conditional probability tables for discrete Bayesian networks.
+- **PyTorch Integration**: Works with any `torch.distributions.Distribution` out of the box.
+- **Analysis Utilities**: `expectation` and `summary` compute weighted posterior statistics from results.
+
+## Installation
+
+```bash
+pip install git+https://github.com/mariusfurter/WeightedSampling.torch.git
+```
 
 ## Usage
 
@@ -16,10 +25,11 @@ A lightweight, vectorized Probabilistic Programming Language (PPL) for Sequentia
 Define a model as a standard Python function using `sample` and `observe`.
 
 ```python
+import torch
 import torch.distributions as dist
-from weighted_sampling import run_smc, sample, observe
+from weighted_sampling import run_smc, sample, observe, expectation
 
-def model():
+def my_model():
     # Define Prior
     # Scalar params are automatically broadcast to N particles
     mu = sample("mu", dist.Normal(0.0, 10.0))
@@ -28,11 +38,11 @@ def model():
     # 'mu' is a tensor of shape (N,)
     observe(torch.tensor(5.0), dist.Normal(mu, 1.0))
 
-    return mu
-
 # Run Inference
-trace = run_smc(model, num_particles=1000)
-print("Posterior Mean:", trace["mu"].mean().item())
+result = run_smc(my_model, num_particles=1000)
+
+# Compute weighted posterior mean
+print("Posterior Mean:", expectation(result, lambda mu: mu).item())
 ```
 
 ### 2. Sequential Models (Random Walk)
@@ -52,11 +62,16 @@ def random_walk(data):
 You can use a proposal distribution different from the target.
 
 ```python
-from weighted_sampling import ImportanceSampler
+from weighted_sampling import run_smc, sample, expectation, ImportanceSampler
+import torch.distributions as dist
 
-# Target: Normal(3, 1), Proposal: Normal(0, 5)
-is_dist = ImportanceSampler(dist.Normal(3.0, 1.0), dist.Normal(0.0, 5.0))
-x = sample("x", is_dist)
+def my_model():
+    # Target: Normal(3, 1), Proposal: Normal(0, 5)
+    is_dist = ImportanceSampler(dist.Normal(3.0, 1.0), dist.Normal(0.0, 5.0))
+    sample("x", is_dist)
+
+result = run_smc(my_model, num_particles=10000)
+print("Mean:", expectation(result, lambda x: x).item())  # ≈ 3.0
 ```
 
 ### 4. Utility Functions
@@ -110,8 +125,11 @@ r = sample("rain", rain_dist(c))
 
 To improve sample diversity and mitigate degeneracy (particle collapse), you can apply MCMC moves to variables.
 
-````python
-from weighted_sampling import move, random_walk_proposal, adaptive_proposal
+```python
+from weighted_sampling import sample, observe, move, run_smc
+from weighted_sampling import RandomWalkProposal, AdaptiveProposal
+import torch
+import torch.distributions as dist
 
 def model_with_move():
     x = sample("x", dist.Normal(0.0, 1.0))
@@ -122,23 +140,29 @@ def model_with_move():
 
     # 2. Or Adaptive Proposal based on particle covariance
     # move("x", AdaptiveProposal())
+```
 
-### Note on Variable Names During Moves
+> **Note on Variable Names During Moves:** When using `move`, the model is replayed to compute acceptance ratios. Variable names must be unique within a single model execution once a move is initiated. Overwriting a variable name (e.g. `x = sample("val", ...); x = sample("val", ...)`) is forbidden and will raise a `ValueError`.
 
-When using `move`, the model is replayed to compute acceptance ratios. To ensure correctness, **variable names must be unique within a single model execution** once a move is initiated. This applies to both `sample` and `deterministic` sites. Overwriting a variable name (e.g. `x = sample("val", ...); x = sample("val", ...)`) is forbidden during moves and will raise a `ValueError`.
+### 7. Model Decorator
 
-```bash
-pip install git+https://github.com/mariusfurter/WeightedSampling.torch.git
-````
+The `@model` decorator allows a model function to be called directly with SMC arguments.
+
+```python
+from weighted_sampling import model
+import torch.distributions as dist
+
+@model
+def my_model(data):
+    mu = sample("mu", dist.Normal(0.0, 10.0))
+    for y in data:
+        observe(y, dist.Normal(mu, 1.0))
+
+result = my_model(data, num_particles=1000, ess_threshold=0.5)
+```
 
 ## Run tests
 
 ```bash
 pytest tests/
-```
-
-or
-
-```bash
-python -m unittest discover tests
 ```

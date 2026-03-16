@@ -7,7 +7,7 @@ from .functional import (
     expectation,
     summary,
     SMCResult,
-    probabilistic_model,
+    model,
 )
 from .distributions import ImportanceSampler
 from .discrete import DiscreteConditional

@@ -56,9 +56,9 @@ class DistributionAdapter:
         else:
             # Try expanded sampling (broadcasting), fallback to independent sampling
             try:
-                x = self.dist.expand((num_particles,)).sample()
+                x = self.dist.expand(torch.Size((num_particles,))).sample()
             except (RuntimeError, ValueError):
-                x = self.dist.sample((num_particles,))
+                x = self.dist.sample(torch.Size((num_particles,)))
 
         if x.shape[0] != num_particles:
             raise RuntimeError(

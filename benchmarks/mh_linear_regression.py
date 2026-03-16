@@ -24,7 +24,7 @@ def linear_model(data):
 
         # Force move on every step to benchmark replay performance
         # threshold=1.1 ensures the move is always executed (ratio <= 1.0 < 1.1)
-        move("a", "b", RandomWalkProposal(scale=0.1), threshold=1.1)
+        move(["a", "b"], RandomWalkProposal(scale=0.1), threshold=1.1)
 
 
 def benchmark_mh():

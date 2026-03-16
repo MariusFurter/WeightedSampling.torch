@@ -124,10 +124,10 @@ class SMCResult(dict):
         return summary(self)
 
 
-def probe_model_structure(model: Callable, *args, **kwargs) -> int:
+def probe_model_structure(model: Callable, *args, **kwargs) -> Tuple[int, int]:
     """
-    Executes the model with a limited context to count the expected number of steps.
-    Used for initializing progress bars.
+    Executes the model with a limited context to count the expected number of steps
+    and determine the trace buffer capacity needed.
 
     Args:
         model: The probabilistic model function.
@@ -135,12 +135,15 @@ def probe_model_structure(model: Callable, *args, **kwargs) -> int:
         kwargs: Keyword arguments to pass to the model.
 
     Returns:
-        The number of steps (sample, observe, move) encountered.
+        A tuple of (num_steps, trace_capacity).
     """
     # Use 1 particle for minimal overhead.
     # ess_threshold=-1.0 disables resampling.
     # track_joint=False eliminates joint log-prob overhead.
-    ctx = SMCContext(num_particles=1, ess_threshold=-1.0, track_joint=False)
+    # Large trace_capacity since N=1 makes it cheap.
+    ctx = SMCContext(
+        num_particles=1, ess_threshold=-1.0, track_joint=False, trace_capacity=65536
+    )
     ctx.model = model
     ctx.args = args
     ctx.kwargs = kwargs
@@ -154,11 +157,10 @@ def probe_model_structure(model: Callable, *args, **kwargs) -> int:
     ctx.step_callback = counter
 
     # We assume the structure is predominantly static independent of N.
-    # We suppress exceptions if possible? No, we want to know if probing fails.
     with SMCScope(ctx):
         model(*args, **kwargs)
 
-    return steps
+    return steps, ctx.trace.columns_used
 
 
 def run_smc(
@@ -168,7 +170,7 @@ def run_smc(
     ess_threshold: float = 0.5,
     track_joint: bool = False,
     progress_bar: bool = False,
-    validate: bool = False,
+    validate: bool = True,
     debug: bool = False,
     **kwargs,
 ) -> SMCResult:
@@ -193,13 +195,22 @@ def run_smc(
                    Key properties: 'log_evidence', 'log_weights'.
     """
     ctx = SMCContext(num_particles, ess_threshold, track_joint=track_joint, debug=debug)
+
+    total_steps = None
+    trace_capacity = None
+    if validate:
+        total_steps, trace_capacity = probe_model_structure(model, *args, **kwargs)
+        ctx = SMCContext(
+            num_particles,
+            ess_threshold,
+            track_joint=track_joint,
+            debug=debug,
+            trace_capacity=trace_capacity,
+        )
+
     ctx.model = model
     ctx.args = args
     ctx.kwargs = kwargs
-
-    total_steps = None
-    if validate:
-        total_steps = probe_model_structure(model, *args, **kwargs)
 
     pbar = None
     if progress_bar:
@@ -217,7 +228,8 @@ def run_smc(
         if pbar is not None:
             pbar.close()
 
-    results = ctx.trace
+    # Convert PackedTrace to a plain dict for the result object
+    results = dict(ctx.trace.items())
 
     # Add metadata to results if keys are available
     if "log_evidence" not in results:
@@ -228,12 +240,12 @@ def run_smc(
     return SMCResult(results)
 
 
-def probabilistic_model(func: Callable) -> Callable:
+def model(func: Callable) -> Callable:
     """
     Decorator to enable running a function as a probabilistic model via SMC.
 
     Usage:
-        @probabilistic_model
+        @model
         def model(data):
             ...
 

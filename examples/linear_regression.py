@@ -18,7 +18,7 @@ def model(data):
     for x, y in data:
         y_pred = a * x + b
         observe(y, dist.Normal(y_pred, 0.1))
-        move("a", "b", RandomWalkProposal(scale=0.1), threshold=0.5)
+        move(["a", "b"], RandomWalkProposal(scale=0.1), threshold=0.5)
 
 
 def generate_synthetic_data(num_points=20):

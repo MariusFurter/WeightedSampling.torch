@@ -181,19 +181,19 @@ class SMCContext:
         if self.debug:
             print(f"[DEBUG] Sample '{name}'")
 
-        # 1. Adapt and Sample (Vectorized)
+        # 1. Resample Check (before incorporating new information)
+        self.resample_if_needed()
+
+        # 2. Adapt and Sample (Vectorized)
         w_dist = as_weighted(distribution)
         x, log_w_inc = w_dist.sample_with_weight(self.N)
 
-        # 2. Update State
+        # 3. Update State
         self.trace[name] = x
         self.log_weights = self.log_weights + log_w_inc
         # Track model density p(x) for MH
         if self.track_joint:
             self.log_joint = self.log_joint + w_dist.log_prob(x)
-
-        # 3. Resample Check
-        self.resample_if_needed()
 
         return self.trace[name]
 
@@ -206,6 +206,9 @@ class SMCContext:
 
         if self.debug:
             print(f"[DEBUG] Observe {value:.2f}")
+
+        # 1. Resample Check (before incorporating new information)
+        self.resample_if_needed()
 
         w_dist = as_weighted(distribution)
         log_w = w_dist.log_prob(value)
@@ -230,9 +233,6 @@ class SMCContext:
                 raise RuntimeError(
                     f"Observed log_prob shape {log_w.shape} incompatible with particles N={self.N}"
                 )
-
-        # Resample Check
-        self.resample_if_needed()
 
     def deterministic_site(self, name: str, value: Any) -> torch.Tensor:
         """

@@ -115,6 +115,33 @@ class SMCResult(dict):
     def log_weights(self) -> torch.Tensor:
         return self["log_weights"]
 
+    def sample(self, num_samples: Optional[int] = None) -> Dict[str, torch.Tensor]:
+        """
+        Resample particles using torch.multinomial according to the normalized weights.
+
+        Args:
+            num_samples: Number of particles to draw. Defaults to the current number of particles.
+
+        Returns:
+            A dictionary mapping variable names to resampled tensors.
+        """
+        log_weights = self["log_weights"]
+        n: int = num_samples if num_samples is not None else log_weights.shape[0]
+        weights = torch.softmax(log_weights, dim=0)
+        indices = torch.multinomial(weights, n, replacement=True)
+
+        resampled = {}
+        for name, value in self.items():
+            if name in ("log_weights", "log_evidence"):
+                continue
+            if (
+                isinstance(value, torch.Tensor)
+                and value.shape[0] == log_weights.shape[0]
+            ):
+                resampled[name] = value[indices]
+
+        return resampled
+
     def expectation(self, test_fn: Callable[..., torch.Tensor]) -> torch.Tensor:
         return expectation(self, test_fn)
 

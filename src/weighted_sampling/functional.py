@@ -115,6 +115,47 @@ class SMCResult(dict):
     def log_weights(self) -> torch.Tensor:
         return self["log_weights"]
 
+    @property
+    def norm_weights(self) -> torch.Tensor:
+        """Normalized (non-log) importance weights."""
+        return torch.softmax(self["log_weights"], dim=0)
+
+    def __repr__(self) -> str:
+        lw = self["log_weights"]
+        N = lw.shape[0]
+        le = self["log_evidence"]
+        w = torch.softmax(lw, dim=0)
+        ess = (1.0 / (w * w).sum()).item()
+
+        var_names = [
+            k
+            for k in self
+            if k not in ("log_weights", "log_evidence")
+            and isinstance(self[k], torch.Tensor)
+            and self[k].shape[0] == N
+        ]
+
+        lines = [
+            f"SMCResult(num_particles={N}, log_evidence={le.item():.4f}, ESS={ess:.1f})",
+            f"  Variables: {', '.join(var_names)}",
+        ]
+        for v in var_names:
+            shape_str = (
+                "x".join(str(s) for s in self[v].shape[1:])
+                if self[v].ndim > 1
+                else "scalar"
+            )
+            lines.append(
+                f"    {v}: shape=({N}, {shape_str})"
+                if shape_str != "scalar"
+                else f"    {v}: shape=({N},)"
+            )
+        return "\n".join(lines)
+
+    def print_summary(self, num_bins: int = 20) -> None:
+        """Print a rich tabular summary with inline histograms."""
+        _print_summary_table(self, num_bins=num_bins)
+
     def sample(self, num_samples: Optional[int] = None) -> Dict[str, torch.Tensor]:
         """
         Resample particles using torch.multinomial according to the normalized weights.
@@ -425,3 +466,164 @@ def summary(results: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         }
 
     return stats
+
+
+def _spark_histogram(
+    values: torch.Tensor, weights: torch.Tensor, num_bins: int, width: int
+) -> List[str]:
+    """
+    Create a small vertical histogram using block characters.
+
+    Returns a list of strings (one per row, from top to bottom) that form
+    a histogram of `width` columns and a fixed height of 4 rows.
+    """
+    HEIGHT = 4
+    blocks = " ▁▂▃▄▅▆▇█"
+
+    vals_flat = values.flatten().float().contiguous()
+    wts = (
+        weights.repeat(vals_flat.shape[0] // weights.shape[0])
+        if vals_flat.shape[0] != weights.shape[0]
+        else weights
+    )
+
+    lo, hi = vals_flat.min().item(), vals_flat.max().item()
+    if lo == hi:
+        # Degenerate: all same value → single spike in the middle
+        bar = [" " * width] * (HEIGHT - 1) + [
+            " " * (width // 2) + "█" + " " * (width - width // 2 - 1)
+        ]
+        return bar
+
+    edges = torch.linspace(lo, hi, num_bins + 1)
+    # Bin indices for each value
+    bin_idx = torch.bucketize(vals_flat, edges[1:-1])  # 0..num_bins-1
+    counts = torch.zeros(num_bins)
+    counts.scatter_add_(0, bin_idx, wts)
+
+    # Resample bins to `width` columns via nearest-neighbor
+    col_idx = torch.linspace(0, num_bins - 1, width).long()
+    col_counts = counts[col_idx]
+
+    mx = col_counts.max().item()
+    if mx == 0:
+        return [" " * width] * HEIGHT
+
+    # Normalize to 0..HEIGHT*8 (sub-block resolution)
+    scaled = (col_counts / mx * HEIGHT * 8).round().int().tolist()
+
+    rows = []
+    for row in range(HEIGHT, 0, -1):
+        line = ""
+        for s in scaled:
+            level = s - (row - 1) * 8
+            if level <= 0:
+                line += " "
+            elif level >= 8:
+                line += blocks[8]
+            else:
+                line += blocks[level]
+        rows.append(line)
+    return rows
+
+
+def _print_summary_table(results: Dict[str, Any], num_bins: int = 20) -> None:
+    """
+    Print a formatted summary table with mini-histograms above each column.
+    """
+    stats = summary(results)
+    if not stats:
+        print("No variables to summarize.")
+        return
+
+    log_weights = results["log_weights"]
+    weights = torch.softmax(log_weights, dim=0)
+    N = log_weights.shape[0]
+
+    # Collect scalar entries: for multi-dim variables, flatten into separate columns
+    columns: list = []  # list of (label, mean_str, std_str, n_unique_str, values_1d)
+    for name, st in stats.items():
+        val = results[name]
+        mean_t = st["mean"]
+        std_t = st["std"]
+        n_unique = st["n_unique"]
+
+        if mean_t.ndim == 0:
+            # scalar variable
+            columns.append(
+                (
+                    name,
+                    f"{mean_t.item():.4f}",
+                    f"{std_t.item():.4f}",
+                    str(n_unique),
+                    val.flatten().float(),
+                )
+            )
+        else:
+            # multi-dim: one column per element (up to 8)
+            numel = mean_t.numel()
+            mean_flat = mean_t.flatten()
+            std_flat = std_t.flatten()
+            limit = min(numel, 8)
+            for i in range(limit):
+                label = f"{name}[{i}]" if numel > 1 else name
+                columns.append(
+                    (
+                        label,
+                        f"{mean_flat[i].item():.4f}",
+                        f"{std_flat[i].item():.4f}",
+                        str(n_unique),
+                        val[:, i].float() if val.ndim > 1 else val.float(),
+                    )
+                )
+            if numel > limit:
+                columns.append((f"{name}[...]", "...", "...", str(n_unique), None))
+
+    # Determine column widths
+    row_labels = ["mean", "std", "n_unique"]
+    label_col_w = max(len(r) for r in row_labels) + 1  # for the row-label column
+
+    col_widths = []
+    for label, m, s, nu, _ in columns:
+        w = max(len(label), len(m), len(s), len(nu), 14)
+        col_widths.append(w)
+
+    # Build histograms (4 rows each)
+    HIST_ROWS = 4
+    hist_blocks: list = []
+    for (label, m, s, nu, vals), cw in zip(columns, col_widths):
+        if vals is not None:
+            hist_blocks.append(_spark_histogram(vals, weights, num_bins, cw))
+        else:
+            hist_blocks.append([" " * cw] * HIST_ROWS)
+
+    # Print header info
+    le = results["log_evidence"]
+    ess = (1.0 / (weights * weights).sum()).item()
+    print(f"SMC Summary (N={N}, log_evidence={le.item():.4f}, ESS={ess:.1f})")
+    print()
+
+    pad = " " * label_col_w
+
+    # Print histogram rows
+    for row_i in range(HIST_ROWS):
+        parts = [pad]
+        for col_i, cw in enumerate(col_widths):
+            parts.append(hist_blocks[col_i][row_i].ljust(cw))
+        print("  ".join(parts))
+
+    # Print variable name row
+    parts = [pad]
+    for (label, *_), cw in zip(columns, col_widths):
+        parts.append(label.center(cw))
+    sep_line = "──".join(["─" * label_col_w] + ["─" * cw for cw in col_widths])
+    print("  ".join(parts))
+    print(sep_line)
+
+    # Print stat rows
+    for row_label in row_labels:
+        parts = [row_label.rjust(label_col_w)]
+        for i, (label, m, s, nu, _) in enumerate(columns):
+            val_str = {"mean": m, "std": s, "n_unique": nu}[row_label]
+            parts.append(val_str.center(col_widths[i]))
+        print("  ".join(parts))

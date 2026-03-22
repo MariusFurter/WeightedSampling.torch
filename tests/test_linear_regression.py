@@ -41,13 +41,13 @@ class TestLinearRegression(unittest.TestCase):
         self.assertAlmostEqual(
             a_mean,
             true_a,
-            delta=0.3,
+            delta=0.15,
             msg=f"Posterior mean of a ({a_mean:.3f}) too far from true value ({true_a})",
         )
         self.assertAlmostEqual(
             b_mean,
             true_b,
-            delta=0.3,
+            delta=0.15,
             msg=f"Posterior mean of b ({b_mean:.3f}) too far from true value ({true_b})",
         )
 

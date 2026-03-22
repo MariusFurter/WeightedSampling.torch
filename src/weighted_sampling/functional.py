@@ -595,8 +595,8 @@ def _format_summary_table(
         w = max(len(label), len(m), len(s), len(nu), 14)
         col_widths.append(w)
 
-    # Build histograms (4 rows each)
-    HIST_ROWS = 4
+    # Build histograms (3 rows each)
+    HIST_ROWS = 3
     hist_blocks: list = []
     for (label, m, s, nu, vals), cw in zip(columns, col_widths):
         if vals is not None:

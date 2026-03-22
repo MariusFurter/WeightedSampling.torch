@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "weighted_sampling"
-version = "0.1.0"
+version = "0.1.1"
 description = "A lightweight, vectorized Probabilistic Programming Language (PPL) for Sequential Monte Carlo (SMC) in PyTorch."
 readme = "README.md"
 license = {text = "MIT"}

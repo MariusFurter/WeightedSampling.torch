@@ -7,6 +7,7 @@ from .functional import (
     expectation,
     summary,
     SMCResult,
+    SMCSummary,
     model,
 )
 from .distributions import ImportanceSampler

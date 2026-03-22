@@ -154,7 +154,7 @@ class SMCResult(dict):
 
     def print_summary(self, num_bins: int = 20) -> None:
         """Print a rich tabular summary with inline histograms."""
-        _print_summary_table(self, num_bins=num_bins)
+        print(_format_summary_table(self, num_bins=num_bins, stats=self.summary()))
 
     def sample(self, num_samples: Optional[int] = None) -> Dict[str, torch.Tensor]:
         """
@@ -184,10 +184,82 @@ class SMCResult(dict):
         return resampled
 
     def expectation(self, test_fn: Callable[..., torch.Tensor]) -> torch.Tensor:
-        return expectation(self, test_fn)
+        """
+        Computes the weighted expectation of a test function.
 
-    def summary(self) -> Dict[str, Dict[str, Any]]:
-        return summary(self)
+        Args:
+            test_fn: A callable that accepts arguments matching variable names
+                     in this result and returns a tensor of shape (N, ...).
+
+        Returns:
+            The weighted expected value, with the particle dimension summed out.
+        """
+        log_weights = self["log_weights"]
+        weights = torch.softmax(log_weights, dim=0)
+
+        sig = inspect.signature(test_fn)
+        accepts_kwargs = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
+
+        if accepts_kwargs:
+            values = test_fn(**self)
+        else:
+            relevant_kwargs = {k: v for k, v in self.items() if k in sig.parameters}
+            values = test_fn(**relevant_kwargs)
+
+        values = torch.as_tensor(values)
+
+        N = weights.shape[0]
+        if values.ndim == 0 or values.shape[0] != N:
+            raise ValueError(
+                f"test_fn returned shape {values.shape}. "
+                f"Expected first dimension to be N={N} (num_particles)."
+            )
+
+        w_expanded = weights.view(N, *([1] * (values.ndim - 1)))
+        return (values * w_expanded).sum(dim=0)
+
+    def summary(self) -> "SMCSummary":
+        """
+        Calculates weighted summary statistics (mean, std, n_unique)
+        for each random variable.
+
+        Returns:
+            SMCSummary: A dict-like object mapping variable names to stat dicts.
+                        Prints as a formatted table with marginal histograms.
+        """
+        log_weights = self["log_weights"]
+        weights = torch.softmax(log_weights, dim=0)
+
+        stats = {}
+        for name, value in self.items():
+            if name in ("log_weights", "log_evidence"):
+                continue
+            if not isinstance(value, torch.Tensor):
+                continue
+            if value.shape[0] != weights.shape[0]:
+                continue
+
+            view_shape = [weights.shape[0]] + [1] * (value.ndim - 1)
+            w_expanded = weights.view(*view_shape)
+
+            mean = (value * w_expanded).sum(dim=0)
+
+            diff_sq = (value - mean) ** 2
+            variance = (diff_sq * w_expanded).sum(dim=0)
+            std = variance.sqrt()
+
+            unique_vals = torch.unique(value, dim=0)
+            n_unique = unique_vals.shape[0]
+
+            stats[name] = {
+                "mean": mean,
+                "std": std,
+                "n_unique": n_unique,
+            }
+
+        return SMCSummary(stats, self)
 
 
 def probe_model_structure(model: Callable, *args, **kwargs) -> Tuple[int, int]:
@@ -344,15 +416,15 @@ def model(func: Callable) -> Callable:
 
 
 def expectation(
-    results: Dict[str, Any],
+    results: SMCResult,
     test_fn: Callable[..., torch.Tensor],
 ) -> torch.Tensor:
     """
     Computes the weighted expectation of a test function based on the results object.
+    Convenience wrapper for ``results.expectation(test_fn)``.
 
     Args:
-        results: The results dictionary returned by run_smc.
-                 Must contain 'log_weights' and sampled variables.
+        results: The SMCResult returned by run_smc.
         test_fn: A callable that accepts arguments matching the keys in results
                  (e.g. variable names) and returns a tensor.
                  The function is applied to the trace tensors (which have shape (N, ...)).
@@ -361,111 +433,40 @@ def expectation(
         The weighted expected value of the test function.
         The result will have the same shape as the output of test_fn, minus the first dimension.
     """
-    if "log_weights" not in results:
-        raise ValueError("Results dictionary must contain 'log_weights'.")
-
-    log_weights = results["log_weights"]
-    # Normalize weights
-    weights = torch.softmax(log_weights, dim=0)
-
-    # Inspect test_fn signature to bind arguments from results
-    sig = inspect.signature(test_fn)
-
-    # Check if test_fn accepts **kwargs
-    accepts_kwargs = any(
-        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-    )
-
-    if accepts_kwargs:
-        values = test_fn(**results)
-    else:
-        # Only pass arguments that are requested
-        relevant_kwargs = {k: v for k, v in results.items() if k in sig.parameters}
-        values = test_fn(**relevant_kwargs)
-
-    values = torch.as_tensor(values)
-
-    # Validation
-    N = weights.shape[0]
-    if values.ndim == 0 or values.shape[0] != N:
-        raise ValueError(
-            f"test_fn returned shape {values.shape}. Expected first dimension to be N={N} (num_particles)."
-        )
-
-    # Broadcast weights to (N, 1, 1, ...) matching values dimensions
-    w_expanded = weights.view(N, *([1] * (values.ndim - 1)))
-
-    return (values * w_expanded).sum(dim=0)
+    return results.expectation(test_fn)
 
 
-def summary(results: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+def summary(results: SMCResult) -> "SMCSummary":
     """
     Calculates weighted summary statistics for the results object.
-    Includes weighted mean, weighted standard deviation, and number of unique particles
-    (as a measure of diversity) for each random variable.
+    Convenience wrapper for ``results.summary()``.
 
     Args:
-        results: The results dictionary returned by run_smc.
+        results: The SMCResult returned by run_smc.
 
     Returns:
-        A dictionary mapping variable names to a dictionary of statistics:
-        {
-            'var_name': {
-                'mean': tensor,
-                'std': tensor,
-                'n_unique': int
-            },
-            ...
-        }
+        SMCSummary: A dict-like object mapping variable names to stat dicts
+                    that prints as a formatted table.
     """
-    if "log_weights" not in results:
-        raise ValueError("Results dictionary must contain 'log_weights'.")
+    return results.summary()
 
-    log_weights = results["log_weights"]
-    weights = torch.softmax(log_weights, dim=0)
 
-    stats = {}
+class SMCSummary(dict):
+    """
+    Weighted summary statistics for SMC results.
+    Behaves like a dict mapping variable names to stat dicts,
+    but prints as a formatted table with marginal histograms.
+    """
 
-    for name, value in results.items():
-        # Skip metadata
-        if name in ("log_weights", "log_evidence"):
-            continue
+    def __init__(self, stats: Dict[str, Dict[str, Any]], results: Dict[str, Any]):
+        super().__init__(stats)
+        self._results = results
 
-        if not isinstance(value, torch.Tensor):
-            continue
+    def __str__(self) -> str:
+        return _format_summary_table(self._results, stats=self)
 
-        # Check if first dimension matches particle count
-        if value.shape[0] != weights.shape[0]:
-            continue
-
-        # 1. Weighted Mean
-        # Reshape weights for broadcasting: (N, 1, 1...)
-        view_shape = [weights.shape[0]] + [1] * (value.ndim - 1)
-        w_expanded = weights.view(*view_shape)
-
-        mean = (value * w_expanded).sum(dim=0)
-
-        # 2. Weighted Standard Deviation
-        # variance = sum(w * (x - mean)^2)
-        # Note: using biased weighted variance for simplicity
-        diff_sq = (value - mean) ** 2
-        variance = (diff_sq * w_expanded).sum(dim=0)
-        std = variance.sqrt()
-
-        # 3. Diversity (Unique Values)
-        # We count unique values along the particle dimension (dim=0)
-        # For a scalar variable (N,), this is unique scalar values.
-        # For a vector variable (N, D), this is unique vectors.
-        unique_vals = torch.unique(value, dim=0)
-        n_unique = unique_vals.shape[0]
-
-        stats[name] = {
-            "mean": mean,
-            "std": std,
-            "n_unique": n_unique,
-        }
-
-    return stats
+    def __repr__(self) -> str:
+        return self.__str__()
 
 
 def _spark_histogram(
@@ -527,14 +528,20 @@ def _spark_histogram(
     return rows
 
 
-def _print_summary_table(results: Dict[str, Any], num_bins: int = 20) -> None:
+def _format_summary_table(
+    results: Dict[str, Any],
+    num_bins: int = 20,
+    stats: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> str:
     """
-    Print a formatted summary table with mini-histograms above each column.
+    Build a formatted summary table string with mini-histograms above each column.
     """
-    stats = summary(results)
+    if stats is None:
+        stats = summary(results)
     if not stats:
-        print("No variables to summarize.")
-        return
+        return "No variables to summarize."
+
+    lines: list = []
 
     log_weights = results["log_weights"]
     weights = torch.softmax(log_weights, dim=0)
@@ -597,33 +604,35 @@ def _print_summary_table(results: Dict[str, Any], num_bins: int = 20) -> None:
         else:
             hist_blocks.append([" " * cw] * HIST_ROWS)
 
-    # Print header info
+    # Header info
     le = results["log_evidence"]
     ess = (1.0 / (weights * weights).sum()).item()
-    print(f"SMC Summary (N={N}, log_evidence={le.item():.4f}, ESS={ess:.1f})")
-    print()
+    lines.append(f"SMC Summary (N={N}, log_evidence={le.item():.4f}, ESS={ess:.1f})")
+    lines.append("")
 
     pad = " " * label_col_w
 
-    # Print histogram rows
+    # Histogram rows
     for row_i in range(HIST_ROWS):
         parts = [pad]
         for col_i, cw in enumerate(col_widths):
             parts.append(hist_blocks[col_i][row_i].ljust(cw))
-        print("  ".join(parts))
+        lines.append("  ".join(parts))
 
-    # Print variable name row
+    # Variable name row
     parts = [pad]
     for (label, *_), cw in zip(columns, col_widths):
         parts.append(label.center(cw))
     sep_line = "──".join(["─" * label_col_w] + ["─" * cw for cw in col_widths])
-    print("  ".join(parts))
-    print(sep_line)
+    lines.append("  ".join(parts))
+    lines.append(sep_line)
 
-    # Print stat rows
+    # Stat rows
     for row_label in row_labels:
         parts = [row_label.rjust(label_col_w)]
         for i, (label, m, s, nu, _) in enumerate(columns):
             val_str = {"mean": m, "std": s, "n_unique": nu}[row_label]
             parts.append(val_str.center(col_widths[i]))
-        print("  ".join(parts))
+        lines.append("  ".join(parts))
+
+    return "\n".join(lines)

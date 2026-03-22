@@ -236,6 +236,7 @@ def run_smc(
     ctx.model = model
     ctx.args = args
     ctx.kwargs = kwargs
+    ctx._total_steps = total_steps
 
     pbar = None
     if progress_bar:

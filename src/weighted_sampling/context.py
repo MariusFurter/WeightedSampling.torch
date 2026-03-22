@@ -166,6 +166,10 @@ class SMCContext:
         # Internal counter to track 'move' calls for robust replay alignment
         self.move_counter = 0
 
+        # Step counting: used to skip resampling on the final step
+        self._step_count = 0
+        self._total_steps: Optional[int] = None
+
         # Optional callback for progress tracking (e.g. updating a progress bar)
         self.step_callback: Optional[Callable[[], None]] = None
 
@@ -181,19 +185,21 @@ class SMCContext:
         if self.debug:
             print(f"[DEBUG] Sample '{name}'")
 
-        # 1. Resample Check (before incorporating new information)
-        self.resample_if_needed()
-
-        # 2. Adapt and Sample (Vectorized)
+        # 1. Adapt and Sample (Vectorized)
         w_dist = as_weighted(distribution)
         x, log_w_inc = w_dist.sample_with_weight(self.N)
 
-        # 3. Update State
+        # 2. Update State
         self.trace[name] = x
         self.log_weights = self.log_weights + log_w_inc
         # Track model density p(x) for MH
         if self.track_joint:
             self.log_joint = self.log_joint + w_dist.log_prob(x)
+
+        # 3. Resample Check (skip on final step to preserve weighted particles)
+        self._step_count += 1
+        if self._total_steps is None or self._step_count < self._total_steps:
+            self.resample_if_needed()
 
         return self.trace[name]
 
@@ -206,9 +212,6 @@ class SMCContext:
 
         if self.debug:
             print(f"[DEBUG] Observe {value:.2f}")
-
-        # 1. Resample Check (before incorporating new information)
-        self.resample_if_needed()
 
         w_dist = as_weighted(distribution)
         log_w = w_dist.log_prob(value)
@@ -233,6 +236,11 @@ class SMCContext:
                 raise RuntimeError(
                     f"Observed log_prob shape {log_w.shape} incompatible with particles N={self.N}"
                 )
+
+        # Resample Check (skip on final step to preserve weighted particles)
+        self._step_count += 1
+        if self._total_steps is None or self._step_count < self._total_steps:
+            self.resample_if_needed()
 
     def deterministic_site(self, name: str, value: Any) -> torch.Tensor:
         """
@@ -378,6 +386,9 @@ class SMCContext:
         """
         if self.step_callback:
             self.step_callback()
+
+        # Keep step counter in sync with probe_model_structure
+        self._step_count += 1
 
         if self.debug:
             print(f"[DEBUG] Move attempt on {names}")

@@ -458,7 +458,7 @@ class SMCSummary(dict):
     but prints as a formatted table with marginal histograms.
     """
 
-    def __init__(self, stats: Dict[str, Dict[str, Any]], results: Dict[str, Any]):
+    def __init__(self, stats: Dict[str, Dict[str, Any]], results: SMCResult):
         super().__init__(stats)
         self._results = results
 
@@ -529,7 +529,7 @@ def _spark_histogram(
 
 
 def _format_summary_table(
-    results: Dict[str, Any],
+    results: SMCResult,
     num_bins: int = 20,
     stats: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> str:

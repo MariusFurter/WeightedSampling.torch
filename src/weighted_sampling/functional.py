@@ -476,9 +476,9 @@ def _spark_histogram(
     Create a small vertical histogram using block characters.
 
     Returns a list of strings (one per row, from top to bottom) that form
-    a histogram of `width` columns and a fixed height of 4 rows.
+    a histogram of `width` columns and a fixed height of 3 rows.
     """
-    HEIGHT = 4
+    HEIGHT = 3
     blocks = " ▁▂▃▄▅▆▇█"
 
     vals_flat = values.flatten().float().contiguous()

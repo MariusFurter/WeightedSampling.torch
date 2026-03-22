@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.2 — 2026-03-22
+
+### Improvements
+
+- **Summary table redesign:** Switched from multi-row block histograms to compact single-row sparkline histograms.
+- **Column separators:** Summary table now uses `│` vertical bars to clearly delineate variable columns.
+
 ## 0.1.1 — 2026-03-22
 
 ### Features

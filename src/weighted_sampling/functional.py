@@ -471,14 +471,12 @@ class SMCSummary(dict):
 
 def _spark_histogram(
     values: torch.Tensor, weights: torch.Tensor, num_bins: int, width: int
-) -> List[str]:
+) -> str:
     """
-    Create a small vertical histogram using block characters.
+    Create a single-row sparkline histogram using block characters.
 
-    Returns a list of strings (one per row, from top to bottom) that form
-    a histogram of `width` columns and a fixed height of 3 rows.
+    Returns a string of `width` characters representing the weighted distribution.
     """
-    HEIGHT = 3
     blocks = " ▁▂▃▄▅▆▇█"
 
     vals_flat = values.flatten().float().contiguous()
@@ -490,15 +488,10 @@ def _spark_histogram(
 
     lo, hi = vals_flat.min().item(), vals_flat.max().item()
     if lo == hi:
-        # Degenerate: all same value → single spike in the middle
-        bar = [" " * width] * (HEIGHT - 1) + [
-            " " * (width // 2) + "█" + " " * (width - width // 2 - 1)
-        ]
-        return bar
+        return " " * (width // 2) + "█" + " " * (width - width // 2 - 1)
 
     edges = torch.linspace(lo, hi, num_bins + 1)
-    # Bin indices for each value
-    bin_idx = torch.bucketize(vals_flat, edges[1:-1])  # 0..num_bins-1
+    bin_idx = torch.bucketize(vals_flat, edges[1:-1])
     counts = torch.zeros(num_bins)
     counts.scatter_add_(0, bin_idx, wts)
 
@@ -508,24 +501,11 @@ def _spark_histogram(
 
     mx = col_counts.max().item()
     if mx == 0:
-        return [" " * width] * HEIGHT
+        return " " * width
 
-    # Normalize to 0..HEIGHT*8 (sub-block resolution)
-    scaled = (col_counts / mx * HEIGHT * 8).round().int().tolist()
-
-    rows = []
-    for row in range(HEIGHT, 0, -1):
-        line = ""
-        for s in scaled:
-            level = s - (row - 1) * 8
-            if level <= 0:
-                line += " "
-            elif level >= 8:
-                line += blocks[8]
-            else:
-                line += blocks[level]
-        rows.append(line)
-    return rows
+    # Normalize to 0..8 (block index)
+    scaled = (col_counts / mx * 8).round().int().tolist()
+    return "".join(blocks[min(s, 8)] for s in scaled)
 
 
 def _format_summary_table(
@@ -595,14 +575,15 @@ def _format_summary_table(
         w = max(len(label), len(m), len(s), len(nu), 14)
         col_widths.append(w)
 
-    # Build histograms (3 rows each)
-    HIST_ROWS = 3
-    hist_blocks: list = []
+    SEP = " │ "
+
+    # Build sparkline histograms (single row each)
+    hist_sparks: list = []
     for (label, m, s, nu, vals), cw in zip(columns, col_widths):
         if vals is not None:
-            hist_blocks.append(_spark_histogram(vals, weights, num_bins, cw))
+            hist_sparks.append(_spark_histogram(vals, weights, num_bins, cw))
         else:
-            hist_blocks.append([" " * cw] * HIST_ROWS)
+            hist_sparks.append(" " * cw)
 
     # Header info
     le = results["log_evidence"]
@@ -612,27 +593,35 @@ def _format_summary_table(
 
     pad = " " * label_col_w
 
-    # Histogram rows
-    for row_i in range(HIST_ROWS):
-        parts = [pad]
-        for col_i, cw in enumerate(col_widths):
-            parts.append(hist_blocks[col_i][row_i].ljust(cw))
-        lines.append("  ".join(parts))
+    # Sparkline row
+    lines.append(
+        pad
+        + SEP
+        + SEP.join(hist_sparks[i].ljust(col_widths[i]) for i in range(len(columns)))
+        + " │"
+    )
 
     # Variable name row
-    parts = [pad]
-    for (label, *_), cw in zip(columns, col_widths):
-        parts.append(label.center(cw))
-    sep_line = "──".join(["─" * label_col_w] + ["─" * cw for cw in col_widths])
-    lines.append("  ".join(parts))
+    lines.append(
+        pad
+        + SEP
+        + SEP.join(label.center(cw) for (label, *_), cw in zip(columns, col_widths))
+        + " │"
+    )
+
+    # Separator line
+    sep_line = (
+        "─" * label_col_w + "─┼─" + "─┼─".join("─" * cw for cw in col_widths) + "─┤"
+    )
     lines.append(sep_line)
 
     # Stat rows
     for row_label in row_labels:
-        parts = [row_label.rjust(label_col_w)]
+        parts = row_label.rjust(label_col_w)
+        cells = []
         for i, (label, m, s, nu, _) in enumerate(columns):
             val_str = {"mean": m, "std": s, "n_unique": nu}[row_label]
-            parts.append(val_str.center(col_widths[i]))
-        lines.append("  ".join(parts))
+            cells.append(val_str.center(col_widths[i]))
+        lines.append(parts + SEP + SEP.join(cells) + " │")
 
     return "\n".join(lines)
